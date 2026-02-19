@@ -3264,6 +3264,7 @@ int table_print_with_pager(
                 bool show_header) {
 
         bool saved_header;
+        size_t saved_width;
         int r;
 
         assert(t);
@@ -3274,10 +3275,18 @@ int table_print_with_pager(
         if (json_format_flags & (SD_JSON_FORMAT_OFF|SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_PRETTY_AUTO))
                 pager_open(pager_flags);
 
+        /* If the pager is explicitly disabled and the table hasn't been given an explicit width, use the
+         * full requested width rather than clipping to the terminal width. Without a pager, long lines can
+         * be scrolled horizontally (or piped/redirected), so there's no reason to truncate content. */
+        saved_width = t->width;
+        if ((pager_flags & PAGER_DISABLE) && t->width == SIZE_MAX)
+                t->width = 0;
+
         saved_header = t->header;
         t->header = show_header;
         r = table_print_json(t, stdout, json_format_flags);
         t->header = saved_header;
+        t->width = saved_width;
         if (r < 0)
                 return table_log_print_error(r);
 
