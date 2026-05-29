@@ -237,10 +237,11 @@ int make_filesystem(
                         return log_oom();
         }
 
-        if (STR_IN_SET(fstype, "ext2", "ext3", "ext4", "xfs", "swap")) {
+        if (STR_IN_SET(fstype, "ext2", "ext3", "ext4", "xfs", "swap", "bcachefs")) {
                 size_t max_len =
                         streq(fstype, "xfs") ? 12 :
                         streq(fstype, "swap") ? 15 :
+                        streq(fstype, "bcachefs") ? 64 :
                         16;
 
                 r = mangle_linux_fs_label(label, max_len, &mangled_label);
@@ -505,6 +506,27 @@ int make_filesystem(
                 if (strv_extend_many(&argv, node, root) < 0)
                         return log_oom();
 
+        } else if (streq(fstype, "bcachefs")) {
+                argv = strv_new(mkfs,
+                                "--label", label,
+                                "--uuid", vol_id);
+                if (!argv)
+                        return log_oom();
+
+                if (FLAGS_SET(flags, MKFS_DISCARD) && strv_extend(&argv, "--discard") < 0)
+                        return log_oom();
+
+                if (compression) {
+                        if (strv_extendf(&argv, "--compression=%s", compression) < 0)
+                                return log_oom();
+                }
+
+                if (FLAGS_SET(flags, MKFS_QUIET) && strv_extend_many(&argv, "--silent") < 0)
+                        return log_oom();
+
+                if (strv_extend(&argv, node) < 0)
+                        return log_oom();
+
         } else {
                 /* Generic fallback for all other file systems */
                 argv = strv_new(mkfs, node);
@@ -572,7 +594,7 @@ int make_filesystem(
                         return r;
         }
 
-        if (STR_IN_SET(fstype, "ext2", "ext3", "ext4", "btrfs", "f2fs", "xfs", "vfat", "swap"))
+        if (STR_IN_SET(fstype, "ext2", "ext3", "ext4", "btrfs", "f2fs", "xfs", "vfat", "swap", "bcachefs"))
                 log_info("%s successfully formatted as %s (label \"%s\", uuid %s)",
                          node, fstype, label, vol_id);
         else if (streq(fstype, "erofs"))

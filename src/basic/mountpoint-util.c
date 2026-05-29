@@ -439,7 +439,7 @@ bool fstype_can_discard(const char *fstype) {
 
         /* Use a curated list as first check, to avoid calling fsopen() which might load kmods, which might
          * not be allowed in our MAC context. */
-        if (STR_IN_SET(fstype, "btrfs", "f2fs", "ext4", "vfat", "xfs"))
+        if (STR_IN_SET(fstype, "bcachefs", "btrfs", "f2fs", "ext4", "vfat", "xfs"))
                 return true;
 
         /* On new kernels we can just ask the kernel */

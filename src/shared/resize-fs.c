@@ -100,6 +100,9 @@ uint64_t minimal_size_by_fs_magic(statfs_f_type_t magic) {
         case (statfs_f_type_t) BTRFS_SUPER_MAGIC:
                 return  BTRFS_MINIMAL_SIZE;
 
+        case (statfs_f_type_t) BCACHEFS_SUPER_MAGIC:
+                return BCACHEFS_MINIMAL_SIZE;
+
         default:
                 return UINT64_MAX;
         }
@@ -115,6 +118,9 @@ uint64_t minimal_size_by_fs_name(const char *name) {
 
         if (streq_ptr(name, "btrfs"))
                 return BTRFS_MINIMAL_SIZE;
+
+        if (streq_ptr(name, "bcachefs"))
+                return BCACHEFS_MINIMAL_SIZE;
 
         return UINT64_MAX;
 }

@@ -9,6 +9,7 @@ int resize_fs(int fd, uint64_t sz, uint64_t *ret_size);
 #define BTRFS_MINIMAL_SIZE (256U*U64_MB)
 #define XFS_MINIMAL_SIZE (300U*U64_MB)
 #define EXT4_MINIMAL_SIZE (32U*U64_MB)
+#define BCACHEFS_MINIMAL_SIZE (128U*U64_MB)
 
 uint64_t minimal_size_by_fs_magic(statfs_f_type_t magic);
 uint64_t minimal_size_by_fs_name(const char *name);
