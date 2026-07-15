@@ -5,16 +5,16 @@
 # Julia Dronova <juliette.tux@gmail.com>, 2013.
 # Sergey Ptashnick <0comffdiz@inbox.ru>, 2013-2018.
 # Vladimir Yerilov <openmindead@gmail.com>, 2020.
-# Alexey Rubtsov <rushills@gmail.com>, 2021.
-# Olga Smirnova <mistresssilvara@hotmail.com>, 2022.
-# Andrei Stepanov <adem4ik@gmail.com>, 2023.
+# Alexey Rubtsov <rushills@gmail.com>, 2021, 2026.
+# Olga Smirnova <mistresssilvara@hotmail.com>, 2022, 2026.
+# Andrei Stepanov <adem4ik@gmail.com>, 2023, 2026.
 # "Sergey A." <sw@atrus.ru>, 2023, 2024.
 # "Sergey A." <Ser82-png@yandex.ru>, 2024, 2025, 2026.
 msgid ""
 msgstr ""
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-05-30 00:13+0200\n"
-"PO-Revision-Date: 2026-03-12 13:58+0000\n"
+"POT-Creation-Date: 2026-06-01 11:49+0200\n"
+"PO-Revision-Date: 2026-06-21 11:10+0000\n"
 "Last-Translator: \"Sergey A.\" <Ser82-png@yandex.ru>\n"
 "Language-Team: Russian <https://translate.fedoraproject.org/projects/systemd/"
 "main/ru/>\n"
@@ -24,7 +24,7 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=n%10==1 && n%100!=11 ? 0 : n%10>=2 && "
 "n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2;\n"
-"X-Generator: Weblate 5.16.2\n"
+"X-Generator: Weblate 2026.6.1\n"
 
 #: src/core/org.freedesktop.systemd1.policy.in:22
 msgid "Send passphrase back to system"
@@ -962,12 +962,13 @@ msgstr ""
 
 #: src/machine/org.freedesktop.machine1.policy:95
 msgid "Inspect local virtual machines and containers"
-msgstr ""
+msgstr "Проверка локальных виртуальных машин и контейнеров"
 
 #: src/machine/org.freedesktop.machine1.policy:96
 msgid ""
 "Authentication is required to inspect local virtual machines and containers."
 msgstr ""
+"Требуется авторизация для проверки локальных виртуальных машин и контейнеров."
 
 #: src/machine/org.freedesktop.machine1.policy:105
 msgid "Create a local virtual machine or container"
@@ -1005,13 +1006,15 @@ msgstr ""
 
 #: src/machine/org.freedesktop.machine1.policy:137
 msgid "Inspect local virtual machine and container images"
-msgstr ""
+msgstr "Проверка образов локальных виртуальных машин и контейнеров"
 
 #: src/machine/org.freedesktop.machine1.policy:138
 msgid ""
 "Authentication is required to inspect local virtual machine and container "
 "images."
 msgstr ""
+"Требуется авторизация для проверки образов локальных виртуальных машин и "
+"контейнеров."
 
 #: src/network/org.freedesktop.network1.policy:22
 msgid "Set NTP servers"
@@ -1293,19 +1296,19 @@ msgstr "Чтобы сбросить статистику, необходимо �
 
 #: src/resolve/org.freedesktop.resolve1.policy:209
 msgid "Flush DNS caches"
-msgstr ""
+msgstr "Очистить кэши DNS"
 
 #: src/resolve/org.freedesktop.resolve1.policy:210
 msgid "Authentication is required to flush DNS caches."
-msgstr ""
+msgstr "Требуется авторизация для очистки кэшей DNS."
 
 #: src/resolve/org.freedesktop.resolve1.policy:220
 msgid "Reset server features"
-msgstr ""
+msgstr "Сбросить возможности сервера"
 
 #: src/resolve/org.freedesktop.resolve1.policy:221
 msgid "Authentication is required to reset server features."
-msgstr ""
+msgstr "Требуется авторизация для сброса возможностей сервера."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:38
 msgid "Check for system updates"
@@ -1318,11 +1321,11 @@ msgstr ""
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:48
 msgid "Cancel checking for system updates"
-msgstr ""
+msgstr "Отменить проверку системных обновлений"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:49
 msgid "Authentication is required to cancel checking for system updates."
-msgstr ""
+msgstr "Требуется авторизация для отмены проверки системных обновлений."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:58
 msgid "Install system updates"
@@ -1334,11 +1337,11 @@ msgstr "Чтобы установить обновления системы, н�
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:68
 msgid "Cancel installing system updates"
-msgstr ""
+msgstr "Отменить установку системных обновлений"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:69
 msgid "Authentication is required to cancel installing system updates."
-msgstr ""
+msgstr "Требуется авторизация для отмены установки системных обновлений."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:78
 msgid "Install specific system version"
@@ -1354,29 +1357,31 @@ msgstr ""
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:88
 msgid "Cancel installing specific system version"
-msgstr ""
+msgstr "Отменить установку определённой версии системы"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:89
 msgid ""
 "Authentication is required to cancel updating the system to a specific "
 "(possibly old) version."
 msgstr ""
+"Требуется авторизация для отмены обновления системы до определённой "
+"(возможно, старой) версии."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:98
 msgid "Clean up old system updates"
-msgstr ""
+msgstr "Очистить старые системные обновления"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:99
 msgid "Authentication is required to clean up old system updates."
-msgstr ""
+msgstr "Требуется авторизация для очистки старых системных обновлений."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:108
 msgid "Cancel cleaning up old system updates"
-msgstr ""
+msgstr "Отменить очистку старых системных обновлений"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:109
 msgid "Authentication is required to cancel cleanup of old system updates."
-msgstr ""
+msgstr "Требуется авторизация для отмены очистки старых системных обновлений."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:118
 msgid "Manage optional features"
@@ -1487,17 +1492,24 @@ msgstr ""
 "Чтобы отправить сигнал заморозки или разморозки процессам юнита «$(unit)», "
 "необходимо пройти аутентификацию."
 
-#: src/shared/libfido2-util.c:497 src/shared/libfido2-util.c:554
+#: src/shared/libfido2-util.c:500 src/shared/libfido2-util.c:557
 msgid "Please confirm presence on security token to unlock."
-msgstr ""
+msgstr "Подтвердите присутствие на токене безопасности для разблокировки."
 
-#: src/shared/libfido2-util.c:513
+#: src/shared/libfido2-util.c:516
 msgid "Please verify user on security token to unlock."
-msgstr ""
+msgstr "Подтвердите пользователя на токене безопасности для разблокировки."
 
-#: src/shared/libfido2-util.c:926
-msgid "Please enter security token PIN:"
+#: src/shared/libfido2-util.c:936
+#, c-format
+msgid ""
+"Please enter security token PIN (remaining attempts before lock-out: %d):"
 msgstr ""
+"Введите PIN-код токена безопасности (осталось попыток до блокировки: %d):"
+
+#: src/shared/libfido2-util.c:948
+msgid "Please enter security token PIN:"
+msgstr "Введите PIN-код токена безопасности:"
 
 #~ msgid "Cleanup old system updates"
 #~ msgstr "Удаление устаревших обновлений системы"

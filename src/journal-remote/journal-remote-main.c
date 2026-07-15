@@ -9,12 +9,14 @@
 #include "build.h"
 #include "conf-parser.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "format-table.h"
 #include "format-util.h"
 #include "fileio.h"
 #include "hashmap.h"
+#include "journal-authenticate.h"
 #include "journal-compression-util.h"
 #include "journal-remote.h"
 #include "journal-remote-write.h"
@@ -221,10 +223,13 @@ static int build_accept_encoding(char **ret) {
         return 0;
 }
 
-static int request_meta(void **connection_cls, int fd, char *hostname) {
+static int request_meta(void **connection_cls, int fd, char *_hostname) {
         int r;
 
         assert(connection_cls);
+
+        /* This takes ownership of the hostname in all cases, including on failure. */
+        _cleanup_free_ char *hostname = TAKE_PTR(_hostname);
 
         if (*connection_cls)
                 return 0; /* already assigned. */
@@ -232,10 +237,9 @@ static int request_meta(void **connection_cls, int fd, char *hostname) {
         Writer *writer;
         r = journal_remote_get_writer(journal_remote_server_global, hostname, &writer);
         if (r < 0)
-                return log_warning_errno(r, "Failed to get writer for source %s: %m",
-                                         hostname);
+                return log_warning_errno(r, "Failed to get writer for source %s: %m", hostname);
 
-        _cleanup_(source_freep) RemoteSource *source = source_new(fd, true, hostname, writer);
+        _cleanup_(source_freep) RemoteSource *source = source_new(fd, true, TAKE_PTR(hostname), writer);
         if (!source)
                 return log_oom();
 
@@ -445,13 +449,12 @@ static mhd_result request_handler(
 
         assert(hostname);
 
-        r = request_meta(connection_cls, fd, hostname);
+        r = request_meta(connection_cls, fd, TAKE_PTR(hostname));
         if (r == -ENOMEM)
                 return respond_oom(connection);
         else if (r < 0)
                 return mhd_respondf(connection, r, MHD_HTTP_INTERNAL_SERVER_ERROR, "%m");
 
-        hostname = NULL;
         return MHD_YES;
 }
 
@@ -466,7 +469,7 @@ static int setup_microhttpd_server(RemoteServer *s,
 #if HAVE_MICROHTTPD
         int r;
 
-        r = dlopen_microhttpd(LOG_ERR);
+        r = DLOPEN_MICROHTTPD(LOG_ERR, required);
         if (r < 0)
                 return r;
 
@@ -1163,7 +1166,14 @@ static int run(int argc, char **argv) {
         _cleanup_free_ char *cert = NULL, *trust = NULL;
         int r;
 
+        COMPRESS_DEFAULT_NOTE;
+        LIBCRYPTO_NOTE(suggested);
+        LIBGNUTLS_NOTE(suggested);
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
+
+        journal_auth_init();
 
         r = parse_config();
         if (r < 0)

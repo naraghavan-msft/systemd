@@ -3,7 +3,7 @@
 systemd_networkd_sources = files(
         'networkd.c'
 )
-systemd_networkd_extract_sources = files(
+systemd_networkd_export_sources = files(
         'netdev/bareudp.c',
         'netdev/batadv.c',
         'netdev/bond.c',
@@ -161,34 +161,27 @@ netdev_gperf_c = custom_target(
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += [networkd_gperf_c, networkd_network_gperf_c, netdev_gperf_c]
-systemd_networkd_extract_sources += [networkd_gperf_c, networkd_network_gperf_c, netdev_gperf_c]
-
-if get_option('link-networkd-shared')
-        networkd_link_with = [libshared]
-else
-        networkd_link_with = [libsystemd_static,
-                              libshared_static]
-endif
+systemd_networkd_export_sources += [networkd_gperf_c, networkd_network_gperf_c, netdev_gperf_c]
 
 network_includes = [include_directories(['.', 'netdev', 'tc']), libsystemd_network_includes]
 
 network_test_template = test_template + {
         'conditions' : ['ENABLE_NETWORKD'],
         'link_with' : [
-                networkd_link_with,
+                libshared,
                 libsystemd_network,
         ],
-        'objects' : ['systemd-networkd'],
+        'import' : ['systemd-networkd'],
         'include_directories' : network_includes,
 }
 
 network_fuzz_template = fuzz_template + {
         'conditions' : ['ENABLE_NETWORKD'],
         'link_with' : [
-                networkd_link_with,
+                libshared,
                 libsystemd_network,
         ],
-        'objects' : ['systemd-networkd'],
+        'import' : ['systemd-networkd'],
         'include_directories' : network_includes,
 }
 
@@ -198,22 +191,26 @@ executables += [
                 'dbus' : true,
                 'conditions' : ['ENABLE_NETWORKD'],
                 'sources' : systemd_networkd_sources,
-                'extract' : systemd_networkd_extract_sources,
+                'export' : systemd_networkd_export_sources,
                 'include_directories' : network_includes,
                 'link_with' : [
+                        libshared,
                         libsystemd_network,
-                        networkd_link_with,
+                ],
+                'dependencies' : [
+                        libbpf_cflags,
                 ],
                 'bpf_programs': [
                         'sysctl-monitor',
-                ]
+                ],
+                'install' : get_option('link-networkd-shared') ? 'yes' : 'static',
         },
         libexec_template + {
                 'name' : 'systemd-networkd-wait-online',
                 'public' : true,
                 'conditions' : ['ENABLE_NETWORKD'],
                 'sources' : systemd_networkd_wait_online_sources,
-                'link_with' : networkd_link_with,
+                'install' : get_option('link-networkd-shared') ? 'yes' : 'static',
         },
         executable_template + {
                 'name' : 'networkctl',
@@ -222,19 +219,23 @@ executables += [
                 'sources' : networkctl_sources,
                 'include_directories' : libsystemd_network_includes,
                 'link_with' : [
+                        libshared,
                         libsystemd_network,
-                        networkd_link_with,
                 ],
+                'dependencies' : [
+                        libselinux_cflags,
+                ],
+                'install' : get_option('link-networkd-shared') ? 'yes' : 'static',
         },
         libexec_template + {
                 'name' : 'systemd-network-generator',
                 'sources' : files('generator/network-generator-main.c'),
-                'extract' : files('generator/network-generator.c'),
-                'link_with' : networkd_link_with,
+                'export' : files('generator/network-generator.c'),
+                'install' : get_option('link-networkd-shared') ? 'yes' : 'static',
         },
         test_template + {
                 'sources' : files('generator/test-network-generator.c'),
-                'objects' : ['systemd-network-generator'],
+                'import' : ['systemd-network-generator'],
                 'suite' : 'network',
         },
         network_test_template + {
@@ -257,7 +258,6 @@ executables += [
         test_template + {
                 'sources' : files('test-modem-manager-mock.c'),
                 'conditions' : ['ENABLE_NETWORKD'],
-                'link_with' : [libshared],
                 'type' : 'manual',
         },
         network_fuzz_template + {

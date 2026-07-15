@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_LIBCURL
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBCURL
+#  error "missing libcurl_cflags in meson dependency."
+#endif
+
 #include <curl/curl.h>            /* IWYU pragma: export */
 
 #include "dlfcn-util.h"
@@ -70,7 +75,12 @@ int curl_append_to_header(struct curl_slist **list, char **headers);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(CURL*, sym_curl_easy_cleanup, curl_easy_cleanupp, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct curl_slist*, sym_curl_slist_free_all, curl_slist_free_allp, NULL);
-
 #endif
 
-int dlopen_curl(int log_level);
+int dlopen_curl(int log_level) _dlopen_loader_;
+
+#define DLOPEN_CURL(log_level, priority)                                \
+        ({                                                              \
+                LIBCURL_NOTE(priority);                                 \
+                dlopen_curl(log_level);                                 \
+        })

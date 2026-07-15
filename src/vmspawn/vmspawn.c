@@ -29,6 +29,7 @@
 #include "copy.h"
 #include "discover-image.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "escape.h"
 #include "ether-addr-util.h"
 #include "event-util.h"
@@ -46,6 +47,7 @@
 #include "hostname-setup.h"
 #include "hostname-util.h"
 #include "id128-util.h"
+#include "initrd-cpio.h"
 #include "kernel-image.h"
 #include "log.h"
 #include "machine-bind-user.h"
@@ -57,8 +59,8 @@
 #include "namespace-util.h"
 #include "netif-util.h"
 #include "nsresource.h"
-#include "osc-context.h"
 #include "options.h"
+#include "osc-context.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -78,6 +80,7 @@
 #include "socket-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "swtpm-util.h"
@@ -103,6 +106,13 @@
 #define DISK_SERIAL_MAX_LEN_SCSI        30
 #define DISK_SERIAL_MAX_LEN_NVME        20
 #define DISK_SERIAL_MAX_LEN_VIRTIO_BLK  20
+
+/* Well-known endpoints for the host's TDX Quote Generation Service (qgsd), auto-discovered so the
+ * guest can obtain TD Quotes. The Intel reference qgsd listens on a unix socket; the common
+ * deployment listens on vsock port 4050 (cid 2 = host). */
+#define TDX_QGS_UNIX_SOCKET_PATH "/run/tdx-qgs/qgs.socket"
+#define TDX_QGS_VSOCK_CID        "2"
+#define TDX_QGS_VSOCK_PORT       "4050"
 
 /* First and one-past-last pcie.0 device-numbers used for multifunction-packed
  * pcie-root-ports. Sits above the auto-assigned virtio devices (0x01-0x03) and
@@ -633,7 +643,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                OPTION_LONG("coco", "no|sev-snp", "Run the guest as a confidential VM"): {
+                OPTION_LONG("coco", "no|sev-snp|tdx", "Run the guest as a confidential VM"): {
                         ConfidentialComputing cc = confidential_computing_from_string(opts.arg);
                         if (cc < 0)
                                 return log_error_errno(cc, "Unknown --coco= value: %s", opts.arg);
@@ -1555,7 +1565,6 @@ static int cmdline_add_smbios11(char ***cmdline, int smbios_dir_fd, const char *
 }
 
 static int start_tpm(
-                const char *scope,
                 const char *swtpm,
                 const char *runtime_dir,
                 const char *sd_socket_activate,
@@ -1564,30 +1573,26 @@ static int start_tpm(
 
         int r;
 
-        assert(scope);
         assert(swtpm);
         assert(runtime_dir);
         assert(sd_socket_activate);
 
-        _cleanup_free_ char *scope_prefix = NULL;
-        r = unit_name_to_prefix(scope, &scope_prefix);
-        if (r < 0)
-                return log_error_errno(r, "Failed to strip .scope suffix from scope: %m");
-
         _cleanup_free_ char *listen_address = path_join(runtime_dir, "tpm.sock");
         if (!listen_address)
                 return log_oom();
+
+        /* Validate socket path length up front instead of a failure in swtpm */
+        union sockaddr_union sa;
+        r = sockaddr_un_set_path(&sa.un, listen_address);
+        if (r < 0)
+                return log_error_errno(r, "TPM socket path '%s' is too long: %m", listen_address);
 
         _cleanup_free_ char *transient_state_dir = NULL;
         const char *state_dir;
         if (arg_tpm_state_path)
                 state_dir = arg_tpm_state_path;
         else {
-                _cleanup_free_ char *dirname = strjoin(scope_prefix, "-tpm");
-                if (!dirname)
-                        return log_oom();
-
-                transient_state_dir = path_join(runtime_dir, dirname);
+                transient_state_dir = path_join(runtime_dir, "tpm");
                 if (!transient_state_dir)
                         return log_oom();
 
@@ -1686,7 +1691,6 @@ static int find_virtiofsd(char **ret) {
 }
 
 static int start_virtiofsd(
-                const char *scope,
                 const char *directory,
                 uid_t source_uid,
                 uid_t target_uid,
@@ -1697,7 +1701,6 @@ static int start_virtiofsd(
 
         int r;
 
-        assert(scope);
         assert(directory);
         assert(runtime_dir);
 
@@ -1706,11 +1709,8 @@ static int start_virtiofsd(
         if (r < 0)
                 return r;
 
-        _cleanup_free_ char *scope_prefix = NULL;
-        r = unit_name_to_prefix(scope, &scope_prefix);
-        if (r < 0)
-                return log_error_errno(r, "Failed to strip .scope suffix from scope: %m");
-
+        /* A VM may run several virtiofsd instances (one per shared dir), so the random suffix keeps their
+         * sockets distinct within the machine's runtime directory. */
         _cleanup_free_ char *listen_address = NULL;
         if (asprintf(&listen_address, "%s/sock-%"PRIx64, runtime_dir, random_u64()) < 0)
                 return log_oom();
@@ -1718,7 +1718,7 @@ static int start_virtiofsd(
         union sockaddr_union su;
         r = sockaddr_un_set_path(&su.un, listen_address);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to prepare unix socket '%s': %m", listen_address);
 
         _cleanup_close_ int sock = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
         if (sock < 0)
@@ -2544,6 +2544,54 @@ static int prepare_device_info(const char *runtime_dir, MachineConfig *c) {
         return assign_pcie_ports(c);
 }
 
+/* Maps a confidential computing mode to the firmware descriptor feature that firmware must declare
+ * to support it. Note that the feature names are defined by the QEMU firmware interop spec and
+ * deviate slightly from our own names for the same modes (cf. confidential_computing_to_string()):
+ * "sev-snp" vs. "amd-sev-snp", and "tdx" vs. "intel-tdx". */
+static const char* const coco_firmware_feature_table[_COCO_MAX] = {
+        [COCO_AMD_SEV_SNP] = "amd-sev-snp",
+        [COCO_INTEL_TDX]   = "intel-tdx",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(coco_firmware_feature, ConfidentialComputing);
+
+static int discover_ovmf_config(OvmfConfig **ret, sd_json_variant **ret_firmware_json) {
+        int r;
+
+        assert(ret);
+
+        const char *coco_feature = coco_firmware_feature_to_string(arg_confidential_computing);
+        if (coco_feature) {
+                r = set_put_strdup(&arg_firmware_features_include, coco_feature);
+                if (r < 0)
+                        return log_oom();
+
+                /* CoCo firmware is stateless, so Secure Boot keys cannot be enrolled at runtime
+                 * but must have baked-in, enrolled keys, which we avoid in other cases. */
+                if (set_contains(arg_firmware_features_include, "secure-boot")) {
+                        r = set_put_strdup(&arg_firmware_features_include, "enrolled-keys");
+                        if (r < 0)
+                                return log_oom();
+                }
+        }
+
+        FindOvmfConfigFlags flags =
+                arg_confidential_computing != COCO_NO ? FIND_OVMF_STATELESS|FIND_OVMF_REQUIRE_RAW :
+                                                        0;
+
+        r = find_ovmf_config(arg_firmware_features_include, arg_firmware_features_exclude, flags, ret, ret_firmware_json);
+        if (r == -ENOENT && coco_feature)
+                return log_error_errno(r, "No suitable firmware descriptor found for --coco=%s "
+                                       "(requires stateless firmware in raw format with the '%s' firmware feature). "
+                                       "Install a suitable firmware, select a firmware descriptor with --firmware=, or "
+                                       "opt in with --secure-boot=yes if the installed firmware enforces Secure Boot.",
+                                       confidential_computing_to_string(arg_confidential_computing), coco_feature);
+        if (r < 0)
+                return log_error_errno(r, "Failed to find OVMF config: %m");
+
+        return 0;
+}
+
 static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         _cleanup_(ovmf_config_freep) OvmfConfig *ovmf_config = NULL;
         _cleanup_free_ char *qemu_binary = NULL, *mem = NULL;
@@ -2606,23 +2654,57 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 use_kvm = r;
         }
 
-        if (arg_confidential_computing == COCO_AMD_SEV_SNP && !use_kvm)
+        if (arg_confidential_computing != COCO_NO && !use_kvm)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                       "--coco=sev-snp requires KVM, but KVM is not available.");
+                                       "--coco= requires KVM, but KVM is not available.");
 
-        if (arg_firmware_type == FIRMWARE_UEFI && arg_confidential_computing != COCO_AMD_SEV_SNP) {
-                if (arg_firmware)
+        if (arg_firmware_type == FIRMWARE_UEFI) {
+                if (arg_firmware) {
                         r = load_ovmf_config(arg_firmware, &ovmf_config);
-                else
-                        r = find_ovmf_config(arg_firmware_features_include, arg_firmware_features_exclude, &ovmf_config, /* ret_firmware_json= */ NULL);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to find OVMF config: %m");
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to load firmware descriptor '%s': %m", arg_firmware);
+                } else {
+                        r = discover_ovmf_config(&ovmf_config, /* ret_firmware_json= */ NULL);
+                        if (r < 0)
+                                return r;
+                }
 
-                if (set_contains(arg_firmware_features_include, "secure-boot") && !ovmf_config->supports_sb)
+                /* Flash mode "combined" places the variable store in the (writable) executable,
+                 * which would have to be cloned for each guest. */
+                if (streq_ptr(ovmf_config->mode, "combined"))
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                               "Firmware descriptor '%s' declares flash mode 'combined', which is not supported.",
+                                               arg_firmware ?: ovmf_config->path);
+
+                if (arg_confidential_computing != COCO_NO) {
+                        const char *coco_feature = coco_firmware_feature_to_string(arg_confidential_computing);
+
+                        if (!ovmf_config_has_feature(ovmf_config, coco_feature))
+                                return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
+                                                       "Firmware descriptor '%s' does not declare the '%s' feature, but "
+                                                       "--coco=%s requires firmware built specifically for it.",
+                                                       arg_firmware ?: ovmf_config->path, coco_feature,
+                                                       confidential_computing_to_string(arg_confidential_computing));
+                        if (!ovmf_config_is_stateless(ovmf_config))
+                                return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
+                                                       "Firmware descriptor '%s' does not describe stateless firmware, "
+                                                       "but --coco=%s requires stateless firmware.",
+                                                       arg_firmware ?: ovmf_config->path,
+                                                       confidential_computing_to_string(arg_confidential_computing));
+                        if (!streq(ovmf_config_format(ovmf_config), "raw"))
+                                return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
+                                                       "Firmware image '%s' is in %s format, "
+                                                       "but --coco=%s requires a raw image.",
+                                                       ovmf_config->path, ovmf_config_format(ovmf_config),
+                                                       confidential_computing_to_string(arg_confidential_computing));
+                }
+
+                bool sb = ovmf_config_has_feature(ovmf_config, "secure-boot");
+                if (set_contains(arg_firmware_features_include, "secure-boot") && !sb)
                         return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
                                                "Secure Boot requested, but selected OVMF firmware doesn't support it.");
 
-                log_debug("Using OVMF firmware %s Secure Boot support.", ovmf_config->supports_sb ? "with" : "without");
+                log_debug("Using OVMF firmware %s Secure Boot support.", sb ? "with" : "without");
         }
 
         _cleanup_(machine_bind_user_context_freep) MachineBindUserContext *bind_user_context = NULL;
@@ -2652,14 +2734,9 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
         /* Create our runtime directory. We need this for the QMP varlink control socket, the QEMU
          * config file, TPM state, virtiofsd sockets, runtime mounts, and SSH key material. */
-        _cleanup_free_ char *runtime_dir = NULL, *runtime_dir_suffix = NULL;
-        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir_destroy = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
 
-        runtime_dir_suffix = path_join("systemd/vmspawn", arg_machine);
-        if (!runtime_dir_suffix)
-                return log_oom();
-
-        r = runtime_directory_make(arg_runtime_scope, runtime_dir_suffix, &runtime_dir, &runtime_dir_destroy);
+        r = runtime_directory_make(arg_runtime_scope, "systemd/vmspawn", arg_machine, &runtime_dir);
         if (r < 0)
                 return log_error_errno(r, "Failed to create runtime directory: %m");
 
@@ -2684,14 +2761,15 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (r < 0)
                 return r;
 
-        if (arg_confidential_computing == COCO_AMD_SEV_SNP) {
+        if (arg_confidential_computing != COCO_NO) {
                 r = qemu_config_key(config_file, "kernel-irqchip", "split");
                 if (r < 0)
                         return r;
         }
 
-        if (ovmf_config && ARCHITECTURE_SUPPORTS_SMM) {
-                r = qemu_config_key(config_file, "smm", on_off(ovmf_config->supports_sb));
+        if (ovmf_config && ARCHITECTURE_SUPPORTS_SMM && arg_confidential_computing == COCO_NO) {
+                bool sb = ovmf_config_has_feature(ovmf_config, "secure-boot");
+                r = qemu_config_key(config_file, "smm", on_off(sb));
                 if (r < 0)
                         return r;
         }
@@ -2716,6 +2794,10 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
         if (arg_confidential_computing == COCO_AMD_SEV_SNP) {
                 r = qemu_config_key(config_file, "confidential-guest-support", "snp0");
+                if (r < 0)
+                        return r;
+        } else if (arg_confidential_computing == COCO_INTEL_TDX) {
+                r = qemu_config_key(config_file, "confidential-guest-support", "tdx0");
                 if (r < 0)
                         return r;
         }
@@ -2926,6 +3008,41 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                                         "kernel-hashes", "on");
                 if (r < 0)
                         return r;
+        } else if (arg_confidential_computing == COCO_INTEL_TDX) {
+                r = qemu_config_section(config_file, "object", "tdx0",
+                                        "qom-type", "tdx-guest");
+                if (r < 0)
+                        return r;
+
+                /* The guest needs a connection to the TDX Quote Generation Service (QGS) running on
+                 * the host to obtain TD Quotes (e.g. via the systemd-report-sign-tsm). There are two
+                 * well-known interfaces for QGS: a well-known unix socket, or vsock port 4050. QEMU
+                 * only connects on a GetQuote request, and pointing at an absent QGS is harmless,
+                 * the request just fails and the guest gets no quote. */
+                r = is_socket(TDX_QGS_UNIX_SOCKET_PATH);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to check for QGS socket '%s', falling back to vsock: %m", TDX_QGS_UNIX_SOCKET_PATH);
+                if (r > 0) {
+                        r = qemu_config_key(config_file, "quote-generation-socket.type", "unix");
+                        if (r < 0)
+                                return r;
+                        r = qemu_config_key(config_file, "quote-generation-socket.path", TDX_QGS_UNIX_SOCKET_PATH);
+                        if (r < 0)
+                                return r;
+                        log_debug("Using TDX Quote Generation Service at unix socket %s.", TDX_QGS_UNIX_SOCKET_PATH);
+                } else {
+                        r = qemu_config_key(config_file, "quote-generation-socket.type", "vsock");
+                        if (r < 0)
+                                return r;
+                        r = qemu_config_key(config_file, "quote-generation-socket.cid", TDX_QGS_VSOCK_CID);
+                        if (r < 0)
+                                return r;
+                        r = qemu_config_key(config_file, "quote-generation-socket.port", TDX_QGS_VSOCK_PORT);
+                        if (r < 0)
+                                return r;
+                        log_debug("No QGS unix socket found, pointing TDX quote generation at vsock %s:%s.",
+                                  TDX_QGS_VSOCK_CID, TDX_QGS_VSOCK_PORT);
+                }
         }
 
         unsigned child_cid = arg_vsock_cid;
@@ -2947,11 +3064,13 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
         /* -cpu stays on cmdline since not all flags are supported in config. SNP needs a stable,
          * named CPU model so the launch measurement is reproducible across hosts; EPYC-v4 is the
-         * baseline that covers all SNP-capable processors (Milan and later). */
+         * baseline that covers all SNP-capable processors (Milan and later). TDX requires host
+         * CPU model. */
         const char *cpu_model =
 #ifdef __x86_64__
-                arg_confidential_computing == COCO_AMD_SEV_SNP ? "EPYC-v4"
-                                                             : "max,hv_relaxed,hv-vapic,hv-time";
+                arg_confidential_computing == COCO_AMD_SEV_SNP ? "EPYC-v4" :
+                arg_confidential_computing == COCO_INTEL_TDX   ? "host"    :
+                                                                 "max,hv_relaxed,hv-vapic,hv-time";
 #else
                 "max";
 #endif
@@ -3049,6 +3168,13 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 if (r < 0)
                         return r;
 
+                /* When using --console=gui the QEMU window closes immediately when the VM has stopped, so
+                 * any console output at shutdown is lost, which makes debugging difficult. Ensure the VM
+                 * stays booted for a minimum of 15s. */
+                r = strv_prepend(&arg_kernel_cmdline_extra, "systemd.minimum_uptime_sec=15");
+                if (r < 0)
+                        return log_oom();
+
                 break;
 
         case CONSOLE_HEADLESS:
@@ -3085,9 +3211,11 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 }
         }
 
+        /* Memory-mapped firmware asks for -bios loading by definition. Under
+         * confidential computing -bios is used even for (stateless) flash firmware. */
         _cleanup_(unlink_and_freep) char *ovmf_vars = NULL;
-        if (arg_confidential_computing != COCO_NO) {
-                r = strv_extend_many(&cmdline, "-bios", arg_firmware);
+        if (ovmf_config && (arg_confidential_computing != COCO_NO || streq_ptr(ovmf_config->device, "memory"))) {
+                r = strv_extend_many(&cmdline, "-bios", ovmf_config->path);
                 if (r < 0)
                         return r;
         } else {
@@ -3165,13 +3293,12 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to create ephemeral snapshot of '%s': %m", arg_directory);
 
-                        arg_directory = strdup(snapshot_directory);
-                        if (!arg_directory)
+                        r = free_and_strdup(&arg_directory, snapshot_directory);
+                        if (r < 0)
                                 return log_oom();
                 }
 
                 r = start_virtiofsd(
-                                unit,
                                 arg_directory,
                                 /* source_uid= */ arg_uid_shift,
                                 /* target_uid= */ 0,
@@ -3247,7 +3374,6 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return log_oom();
 
                 r = start_virtiofsd(
-                                unit,
                                 m->source,
                                 /* source_uid= */ m->source_uid,
                                 /* target_uid= */ m->target_uid,
@@ -3297,6 +3423,11 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 MachineCredential *existing = machine_credential_find(&arg_credentials, "fstab.extra");
                 if (existing) {
                         _cleanup_free_ char *combined = NULL;
+
+                        if (existing->size >= INT_MAX)
+                                return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
+                                                       "Existing fstab.extra credential is too large (%zu bytes).",
+                                                       existing->size);
 
                         if (existing->size > 0 && existing->data[existing->size - 1] != '\n')
                                 r = asprintf(&combined, "%.*s\n%s", (int) existing->size, existing->data, fstab_extra);
@@ -3364,22 +3495,22 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 if (!GREEDY_REALLOC(children, n_children + 1))
                         return log_oom();
 
-                r = start_tpm(unit, swtpm, runtime_dir, sd_socket_activate, &tpm_socket_address, &child);
+                r = start_tpm(swtpm, runtime_dir, sd_socket_activate, &tpm_socket_address, &child);
                 if (r < 0) {
                         /* only bail if the user asked for a tpm */
                         if (arg_tpm > 0)
                                 return log_error_errno(r, "Failed to start tpm: %m");
 
                         log_debug_errno(r, "Failed to start tpm, ignoring: %m");
+                } else {
+                        _cleanup_(sd_event_source_unrefp) sd_event_source *source = NULL;
+                        r = event_add_child_pidref(event, &source, &child, WEXITED, on_child_exit, /* userdata= */ NULL);
+                        if (r < 0)
+                                return r;
+
+                        pidref_done(&child);
+                        children[n_children++] = TAKE_PTR(source);
                 }
-
-                _cleanup_(sd_event_source_unrefp) sd_event_source *source = NULL;
-                r = event_add_child_pidref(event, &source, &child, WEXITED, on_child_exit, /* userdata= */ NULL);
-                if (r < 0)
-                        return r;
-
-                pidref_done(&child);
-                children[n_children++] = TAKE_PTR(source);
         }
 
         if (tpm_socket_address) {
@@ -3410,26 +3541,6 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         if (r < 0)
                                 return r;
                 }
-        }
-
-        char *initrd = NULL;
-        _cleanup_(rm_rf_physical_and_freep) char *merged_initrd = NULL;
-        size_t n_initrds = strv_length(arg_initrds);
-
-        if (n_initrds == 1)
-                initrd = arg_initrds[0];
-        else if (n_initrds > 1) {
-                r = merge_initrds(&merged_initrd);
-                if (r < 0)
-                        return r;
-
-                initrd = merged_initrd;
-        }
-
-        if (initrd) {
-                r = strv_extend_many(&cmdline, "-initrd", initrd);
-                if (r < 0)
-                        return log_oom();
         }
 
         if (arg_forward_journal) {
@@ -3466,14 +3577,10 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         if (arg_pass_ssh_key) {
-                _cleanup_free_ char *scope_prefix = NULL, *privkey_path = NULL, *pubkey_path = NULL;
+                _cleanup_free_ char *privkey_path = NULL, *pubkey_path = NULL;
                 const char *key_type = arg_ssh_key_type ?: "ed25519";
 
-                r = unit_name_to_prefix(unit, &scope_prefix);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to strip .scope suffix from scope: %m");
-
-                privkey_path = strjoin(runtime_dir, "/", scope_prefix, "-", key_type);
+                privkey_path = path_join(runtime_dir, key_type);
                 if (!privkey_path)
                         return log_oom();
 
@@ -3490,7 +3597,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         if (ssh_public_key_path && ssh_private_key_path) {
-                _cleanup_free_ char *scope_prefix = NULL, *cred_path = NULL;
+                _cleanup_free_ char *cred_path = NULL;
 
                 cred_path = strjoin("ssh.ephemeral-authorized_keys-all:", ssh_public_key_path);
                 if (!cred_path)
@@ -3499,10 +3606,6 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 r = machine_credential_load(&arg_credentials, cred_path);
                 if (r < 0)
                         return log_error_errno(r, "Failed to load credential %s: %m", cred_path);
-
-                r = unit_name_to_prefix(unit, &scope_prefix);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to strip .scope suffix from scope: %m");
 
                 /* on distros that provide their own sshd@.service file we need to provide a dropin which
                  * picks up our public key credential */
@@ -3533,9 +3636,54 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return log_error_errno(r, "Failed to add VSOCK credential: %m");
         }
 
-        r = cmdline_add_credentials(&cmdline, smbios_dir_fd, smbios_dir);
-        if (r < 0)
-                return r;
+        /* Under --coco=sev-snp the SMBIOS and fw_cfg channels normally used to deliver credentials are
+         * not covered by the launch measurement and are silently discarded by the guest PID1 in
+         * confidential VMs. Instead, package credentials into a cpio archive appended to the initrd
+         * (mirroring what systemd-stub does for ESP credentials) so they enter the launch measurement
+         * via QEMU's "kernel-hashes=on". The new initrd path requires a guest PID1 that knows about
+         * /.extra/system_credentials/, so we keep this scoped to SNP for now. Non-SNP guests
+         * continue to use the SMBIOS path below, which works with older systemd versions too.
+         * Must run after all credential-mutating calls above so the cpio captures the complete set. */
+        bool use_initrd_cpio = arg_confidential_computing == COCO_AMD_SEV_SNP &&
+                               arg_credentials.n_credentials > 0;
+
+        _cleanup_(unlink_and_freep) char *credentials_cpio_path = NULL;
+        if (use_initrd_cpio) {
+                r = initrd_cpio_credentials_to_tempfile(&arg_credentials, &credentials_cpio_path);
+                if (r < 0)
+                        return r;
+                r = strv_extend(&arg_initrds, credentials_cpio_path);
+                if (r < 0)
+                        return log_oom();
+        }
+
+        char *initrd = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *merged_initrd = NULL;
+        size_t n_initrds = strv_length(arg_initrds);
+
+        if (n_initrds == 1)
+                initrd = arg_initrds[0];
+        else if (n_initrds > 1) {
+                r = merge_initrds(&merged_initrd);
+                if (r < 0)
+                        return r;
+
+                initrd = merged_initrd;
+        }
+
+        if (initrd) {
+                r = strv_extend_many(&cmdline, "-initrd", initrd);
+                if (r < 0)
+                        return log_oom();
+        }
+
+        /* Under SNP, credentials flow via the initrd cpio above. For everyone else, use the
+         * SMBIOS/fw_cfg/cmdline path. */
+        if (!use_initrd_cpio) {
+                r = cmdline_add_credentials(&cmdline, smbios_dir_fd, smbios_dir);
+                if (r < 0)
+                        return r;
+        }
 
         r = cmdline_add_kernel_cmdline(&cmdline, smbios_dir_fd, smbios_dir);
         if (r < 0)
@@ -4015,7 +4163,14 @@ static int determine_kernel(void) {
         int r;
 
         if (!arg_linux && arg_directory) {
-                /* A kernel is required for directory type images so attempt to find one under /boot and /efi */
+                /* A kernel is required for directory type images so attempt to find one under /boot and /efi.
+                 * Reject a user --initrd= first: discovery would overwrite (and leak) it, and the
+                 * --initrd=/--linux= consistency check in verify_arguments() is bypassed once discovery
+                 * sets arg_linux. */
+                if (!strv_isempty(arg_initrds))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--initrd= cannot be used with --directory= unless --linux= is also specified.");
+
                 r = discover_boot_entry(arg_directory, &arg_linux, &arg_initrds);
                 if (r < 0)
                         return log_error_errno(r, "Failed to locate UKI in directory type image, please specify one with --linux=.");
@@ -4074,6 +4229,19 @@ static int verify_arguments(void) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--grow-image is not supported for qcow2 images, use 'qemu-img resize FILE SIZE'.");
 
+        if (arg_confidential_computing != COCO_NO) {
+                /* Confidential computing firmware is stateless, there is no NVRAM to instantiate from a
+                 * template or to persist. */
+                if (arg_efi_nvram_template)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--efi-nvram-template= cannot be used with --coco=, "
+                                               "confidential computing firmware is stateless.");
+                if (arg_efi_nvram_state_mode == STATE_PATH)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "An explicit --efi-nvram-state= path cannot be used with --coco=, "
+                                               "confidential computing firmware is stateless. Use 'off' or 'auto'.");
+        }
+
         if (arg_confidential_computing == COCO_AMD_SEV_SNP) {
                 if (native_architecture() != ARCHITECTURE_X86_64)
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
@@ -4083,22 +4251,8 @@ static int verify_arguments(void) {
                                                "--coco=sev-snp requires KVM, remove --kvm=no.");
                 if (arg_firmware_type != FIRMWARE_UEFI)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "--coco can't be used with %s firmware",
+                                               "--coco=sev-snp can't be used with %s firmware",
                                                firmware_to_string(arg_firmware_type));
-                /* SNP can't use pflash + NVRAM split, so the firmware-descriptor
-                 * machinery doesn't apply. Require an explicit raw .fd path and
-                 * use it verbatim with -bios later. */
-                if (!arg_firmware)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "--coco=sev-snp requires --firmware=PATH "
-                                               "pointing at a raw SNP-built OVMF .fd binary.");
-                log_debug("Using raw SNP firmware at %s (no NVRAM, no Secure Boot).", arg_firmware);
-                if (set_contains(arg_firmware_features_include, "secure-boot"))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "--secure-boot=yes cannot be combined with --coco.");
-                if (arg_credentials.n_credentials != 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "SMBIOS credentials aren't trusted by the confidential computing guest and will be rejected.");
                 if (arg_tpm > 0)
                         log_warning("TPM can't be trusted by the confidential computing guest");
                 /* kernel-hashes=on only covers what QEMU itself loads via -kernel/-initrd/-append.
@@ -4111,12 +4265,30 @@ static int verify_arguments(void) {
                                                "so kernel, initrd and cmdline are covered by the launch measurement.");
         }
 
+        if (arg_confidential_computing == COCO_INTEL_TDX) {
+                if (native_architecture() != ARCHITECTURE_X86_64)
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                               "--coco=tdx is only supported on x86_64.");
+                if (arg_kvm == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--coco=tdx requires KVM, remove --kvm=no.");
+                if (arg_firmware_type != FIRMWARE_UEFI)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--coco=tdx can't be used with %s firmware",
+                                               firmware_to_string(arg_firmware_type));
+                if (arg_tpm > 0)
+                        log_warning("TPM can't be trusted by the confidential computing guest");
+        }
+
         return 0;
 }
 
 static int run(int argc, char *argv[]) {
         int r, kvm_device_fd = -EBADF, vhost_device_fd = -EBADF;
         _cleanup_strv_free_ char **names = NULL;
+
+        LIBBLKID_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 
@@ -4134,9 +4306,9 @@ static int run(int argc, char *argv[]) {
                 _cleanup_(ovmf_config_freep) OvmfConfig *ovmf_config = NULL;
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
 
-                r = find_ovmf_config(arg_firmware_features_include, arg_firmware_features_exclude, &ovmf_config, &json);
+                r = discover_ovmf_config(&ovmf_config, &json);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to find OVMF config: %m");
+                        return r;
 
                 r = sd_json_variant_dump(json, SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_COLOR_AUTO, stdout, /* prefix= */ NULL);
                 if (r < 0)

@@ -24,6 +24,7 @@
 #include "detach-loopback.h"
 #include "detach-md.h"
 #include "detach-swap.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "exec-util.h"
 #include "fd-util.h"
@@ -340,7 +341,12 @@ static void sleep_until_minimum_uptime(void) {
                 r = safe_atou64(e, &minimum_uptime_usec);
                 if (r < 0)
                         log_warning_errno(r, "Failed to parse $MINIMUM_UPTIME_USEC, ignoring: %s", e);
-        }
+        } else if (detect_virtualization() != VIRTUALIZATION_NONE)
+                /* Enforce the minimum uptime, but don't bother with it in containers/VMs, since – unlike on
+                 * bare metal – the screen output isn't flushed out immediately when we reboot (as real PC
+                 * firmwares do). But skip only if there wasn't an explicit configuration, to let users
+                 * override this. */
+                return;
 
         if (minimum_uptime_usec <= 0) /* turned off? */
                 return;
@@ -369,8 +375,14 @@ int main(int argc, char *argv[]) {
         _cleanup_close_ int luo_session_fd = -EBADF;
         _cleanup_free_ int *luo_fds = NULL;
         _cleanup_free_ char *cgroup = NULL;
+        dual_timestamp shutdown_late_start;
         size_t n_luo_fds = 0;
         int cmd, r;
+
+        LIBSELINUX_NOTE(recommended);
+
+        /* LUO will preserve these across kexec */
+        dual_timestamp_now(&shutdown_late_start);
 
         /* If PID 1 passed us an LUO serialization fd, parse it first so we know which fds to keep open. */
         (void) luo_parse_serialization(&luo_serialization, &luo_fds, &n_luo_fds);
@@ -635,11 +647,13 @@ int main(int argc, char *argv[]) {
 
         notify_supervisor();
 
-        /* Enforce the minimum uptime, but don't bother with it in containers, since – unlike on bare metal
-         * and VMs – the screen output isn't flushed out immediately when we reboot (as OVMF or real PC
-         * firmwares do) */
-        if (!in_container)
-                sleep_until_minimum_uptime();
+        sleep_until_minimum_uptime();
+
+        /* This is conceptually where shutdown is complete and only the final syscall to bring the machine
+         * down is left, so record the late shutdown timestamp here. */
+        dual_timestamp shutdown_late_finish;
+        dual_timestamp_now(&shutdown_late_finish);
+        (void) luo_serialization_add_shutdown_timestamps(&luo_serialization, &shutdown_late_start, &shutdown_late_finish);
 
         if (streq(arg_verb, "exit")) {
                 if (in_container) {

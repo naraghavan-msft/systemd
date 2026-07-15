@@ -3,13 +3,18 @@
 
 #include <syslog.h>
 
+#include "dlopen-note.h"
+#include "forward.h"
+
 #if HAVE_LIBBPF
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBBPF
+#  error "missing libbpf_cflags in meson dependency."
+#endif
 
 #include <bpf/bpf.h>    /* IWYU pragma: export */
 #include <bpf/libbpf.h> /* IWYU pragma: export */
 
 #include "dlfcn-util.h"
-#include "shared-forward.h"
 
 /* Always redeclare these so DLSYM_PROTOTYPE's typeof() resolves regardless of libbpf version;
  * suppress the warning when the libbpf headers already declare them.
@@ -87,7 +92,12 @@ static inline int compat_bpf_map_create(
  * this helper instead of libbpf_get_error() to ensure some of the known ones are translated into errnos
  * we understand. */
 int bpf_get_error_translated(const void *ptr);
-
 #endif
 
-int dlopen_bpf(int log_level);
+int dlopen_bpf(int log_level) _dlopen_loader_;
+
+#define DLOPEN_BPF(log_level, priority)                                 \
+        ({                                                              \
+                LIBBPF_NOTE(priority);                                  \
+                dlopen_bpf(log_level);                                  \
+        })

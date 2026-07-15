@@ -21,6 +21,7 @@
 #include "chase.h"
 #include "compress.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "extract-word.h"
@@ -1076,7 +1077,7 @@ static int verb_dump_list(int argc, char *argv[], uintptr_t _data, void *userdat
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to determine timestamp: %m");
                                 if (usec > arg_until)
-                                        continue;
+                                        break;
                         }
 
                         if (arg_since != USEC_INFINITY && arg_reverse) {
@@ -1086,7 +1087,7 @@ static int verb_dump_list(int argc, char *argv[], uintptr_t _data, void *userdat
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to determine timestamp: %m");
                                 if (usec < arg_since)
-                                        continue;
+                                        break;
                         }
 
                         r = print_entry(j, n_found++, t);
@@ -1488,6 +1489,13 @@ static int run(int argc, char *argv[]) {
         _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         char **args = NULL;
         int r, units_active;
+
+        COMPRESS_DEFAULT_NOTE;
+        LIBACL_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
 
         setlocale(LC_ALL, "");
         log_setup();

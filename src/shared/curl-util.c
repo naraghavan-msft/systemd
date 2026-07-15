@@ -5,7 +5,6 @@
 
 #if HAVE_LIBCURL
 
-#include "sd-dlopen.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
@@ -604,11 +603,7 @@ int dlopen_curl(int log_level) {
 #if HAVE_LIBCURL
         static void *curl_dl = NULL;
 
-        SD_ELF_NOTE_DLOPEN(
-                        "curl",
-                        "Support for downloading and uploading files over HTTP",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libcurl.so.4");
+        LIBCURL_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &curl_dl,

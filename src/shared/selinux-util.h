@@ -3,9 +3,14 @@
 
 #include <sys/socket.h>
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_SELINUX
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBSELINUX
+#  error "missing libselinux_cflags in meson dependency."
+#endif
+
 #include <selinux/avc.h>
 #include <selinux/label.h>
 #include <selinux/context.h>
@@ -52,13 +57,19 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(char*, sym_freecon, freeconp, NULL);
 
 #else
 
-
 static inline void freeconp(char **p) {
         assert(*p == NULL);
 }
+
 #endif
 
-int dlopen_libselinux(int log_level);
+int dlopen_libselinux(int log_level) _dlopen_loader_;
+
+#define DLOPEN_LIBSELINUX(log_level, priority)                          \
+        ({                                                              \
+                LIBSELINUX_NOTE(priority);                              \
+                dlopen_libselinux(log_level);                           \
+        })
 
 #define _cleanup_freecon_ _cleanup_(freeconp)
 

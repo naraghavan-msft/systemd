@@ -2052,7 +2052,7 @@ static int ndisc_router_process_captive_portal(Link *link, sd_ndisc_router *rt, 
                                 target = c;
 
                 assert(target);
-                assert(set_remove(link->ndisc_captive_portals, target) == target);
+                assert_se(set_remove(link->ndisc_captive_portals, target) == target);
                 ndisc_captive_portal_free(target);
         }
 
@@ -2243,7 +2243,7 @@ static int sd_dns_resolver_copy(const sd_dns_resolver *a, sd_dns_resolver *b) {
         /* addrs, n_addrs */
         c.addrs = newdup(union in_addr_union, a->addrs, a->n_addrs);
         if (!c.addrs)
-                return r;
+                return -ENOMEM;
         c.n_addrs = a->n_addrs;
 
         /* dohpath */

@@ -22,6 +22,7 @@
 #include "crypto-util.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "efi-loader.h"
 #include "efivars.h"
 #include "escape.h"
@@ -43,6 +44,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "varlink-io.systemd.BootControl.h"
+#include "varlink-io.systemd.SysUpdate.Notify.h"
 #include "varlink-util.h"
 #include "verbs.h"
 #include "virt.h"
@@ -380,6 +382,9 @@ VERB_SCOPE(, verb_unlink, "unlink", "ID", VERB_ANY, 2, 0,
 VERB_SCOPE(, verb_link, "link", "KERNEL", 2, 2, 0,
            "Create boot loader entry for specified kernel");
 
+VERB_SCOPE_NOARG(, verb_link_auto, "link-auto",
+           "Create boot loader entry for the kernel and extra resources staged in /var/lib/systemd/uki/");
+
 VERB_SCOPE_NOARG(, verb_cleanup, "cleanup",
            "Remove files in ESP not referenced in any boot entry");
 
@@ -690,7 +695,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                                 break;
                         }
 
-                        if (!version_is_valid_versionspec(opts.arg))
+                        if (!version_is_valid(opts.arg, /* flags= */ 0))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid boot menu entry version: %s", opts.arg);
 
                         r = free_and_strdup_warn(&arg_entry_version, opts.arg);
@@ -822,18 +827,23 @@ static int vl_server(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate Varlink server: %m");
 
-        r = sd_varlink_server_add_interface(varlink_server, &vl_interface_io_systemd_BootControl);
+        r = sd_varlink_server_add_interface_many(
+                        varlink_server,
+                        &vl_interface_io_systemd_BootControl,
+                        &vl_interface_io_systemd_SysUpdate_Notify);
         if (r < 0)
-                return log_error_errno(r, "Failed to add Varlink interface: %m");
+                return log_error_errno(r, "Failed to add Varlink interfaces: %m");
 
         r = sd_varlink_server_bind_method_many(
                         varlink_server,
-                        "io.systemd.BootControl.ListBootEntries",     vl_method_list_boot_entries,
-                        "io.systemd.BootControl.SetRebootToFirmware", vl_method_set_reboot_to_firmware,
-                        "io.systemd.BootControl.GetRebootToFirmware", vl_method_get_reboot_to_firmware,
-                        "io.systemd.BootControl.Install",             vl_method_install,
-                        "io.systemd.BootControl.Link",                vl_method_link,
-                        "io.systemd.BootControl.Unlink",              vl_method_unlink);
+                        "io.systemd.BootControl.ListBootEntries",        vl_method_list_boot_entries,
+                        "io.systemd.BootControl.SetRebootToFirmware",    vl_method_set_reboot_to_firmware,
+                        "io.systemd.BootControl.GetRebootToFirmware",    vl_method_get_reboot_to_firmware,
+                        "io.systemd.BootControl.Install",                vl_method_install,
+                        "io.systemd.BootControl.Link",                   vl_method_link,
+                        "io.systemd.BootControl.LinkAuto",               vl_method_link_auto,
+                        "io.systemd.BootControl.Unlink",                 vl_method_unlink,
+                        "io.systemd.SysUpdate.Notify.OnCompletedUpdate", vl_method_on_completed_update);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind Varlink methods: %m");
 
@@ -848,6 +858,13 @@ static int run(int argc, char *argv[]) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBTSS2_ESYS_NOTE(suggested);
+        LIBTSS2_MU_NOTE(suggested);
+        LIBTSS2_RC_NOTE(suggested);
 
         log_setup();
 

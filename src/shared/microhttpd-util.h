@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
-
-int dlopen_microhttpd(int log_level);
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_MICROHTTPD
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBMICROHTTPD
+#  error "missing libmicrohttpd_cflags in meson dependency."
+#endif
 
 #include <microhttpd.h>
 
@@ -133,5 +135,12 @@ int setup_gnutls_logger(char **categories);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct MHD_Daemon*, sym_MHD_stop_daemon, MHD_stop_daemonp, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct MHD_Response*, sym_MHD_destroy_response, MHD_destroy_responsep, NULL);
-
 #endif
+
+int dlopen_microhttpd(int log_level) _dlopen_loader_;
+
+#define DLOPEN_MICROHTTPD(log_level, priority)                          \
+        ({                                                              \
+                LIBMICROHTTPD_NOTE(priority);                           \
+                dlopen_microhttpd(log_level);                           \
+        })

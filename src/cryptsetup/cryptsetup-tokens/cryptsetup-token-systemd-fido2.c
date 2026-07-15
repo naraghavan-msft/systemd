@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <libcryptsetup.h>
 #include <string.h>
 #include <syslog.h>
 
@@ -9,6 +8,7 @@
 #include "alloc-util.h"
 #include "cryptsetup-token.h"
 #include "cryptsetup-token-util.h"
+#include "dlopen-note.h"
 #include "luks2-fido2.h"
 #include "memory-util.h"
 #include "version.h"
@@ -18,7 +18,9 @@
 #define TOKEN_VERSION_MINOR "0"
 
 /* for libcryptsetup debug purpose */
-_public_ const char *cryptsetup_token_version(void) {
+_public_ const char* cryptsetup_token_version(void) {
+        LIBFIDO2_NOTE(suggested);
+
         return TOKEN_VERSION_MAJOR "." TOKEN_VERSION_MINOR " systemd-v" PROJECT_VERSION_FULL " (" GIT_VERSION ")";
 }
 
@@ -38,7 +40,7 @@ _public_ int cryptsetup_token_open_pin(
         assert(pin || pin_size == 0);
         assert(token >= 0);
 
-        r = dlopen_cryptsetup(LOG_DEBUG);
+        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, required);
         if (r < 0)
                 return r;
 
@@ -103,7 +105,7 @@ _public_ void cryptsetup_token_dump(
 
         assert(json);
 
-        if (dlopen_cryptsetup(LOG_DEBUG) < 0)
+        if (DLOPEN_CRYPTSETUP(LOG_DEBUG, required) < 0)
                 return;
 
         r = parse_luks2_fido2_data(cd, json, &rp_id, &salt, &salt_size, &cid, &cid_size, &required);
@@ -170,7 +172,7 @@ _public_ int cryptsetup_token_validate(
 
         assert(json);
 
-        r = dlopen_cryptsetup(LOG_DEBUG);
+        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, required);
         if (r < 0)
                 return r;
 

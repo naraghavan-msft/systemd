@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mount.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <unistd.h>
 
 #include "sd-event.h"
@@ -78,20 +78,29 @@ static void wait_for_service_finish(Manager *m, Unit *unit) {
 
         ASSERT_NOT_NULL(m);
 
-        /* Bump the timeout when running in plain QEMU, as some more involved tests might start hitting the
-         * default 2m timeout (like exec-dynamicuser-statedir.service) */
-        if (detect_virtualization() == VIRTUALIZATION_QEMU)
+        /* Bump the timeout when running in plain QEMU or in CI, as some more involved tests might start
+         * hitting the default 2m timeout (like exec-dynamicuser-statedir.service). */
+        if (detect_virtualization() == VIRTUALIZATION_QEMU || ci_environment())
                 timeout *= 2;
 
         printf("%s\n", unit->id);
         exec_context_dump(&service->exec_context, stdout, "\t");
 
+        /* Use a per-Exec timeout rather than a service timeout, as especially under sanitizers some test
+         * units running many commands can hit the service timeout. */
         _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
         ASSERT_OK(sd_event_add_time_relative(m->event, &s, CLOCK_MONOTONIC, timeout, 0, time_handler, unit));
 
         /* Here, sd_event_loop() cannot be used, as the sd_event object will be reused in the next test case. */
-        while (!IN_SET(service->state, SERVICE_DEAD, SERVICE_FAILED))
+        ExecCommand *last_command = service->main_command;
+        while (!IN_SET(service->state, SERVICE_DEAD, SERVICE_FAILED)) {
                 ASSERT_OK(sd_event_run(m->event, 100 * USEC_PER_MSEC));
+
+                if (service->main_command != last_command) {
+                        last_command = service->main_command;
+                        ASSERT_OK(sd_event_source_set_time_relative(s, timeout));
+                }
+        }
 }
 
 static void check_main_result(const char *file, unsigned line, const char *func,
@@ -295,7 +304,7 @@ static void _test(const char *file, unsigned line, const char *func,
 
         ASSERT_NOT_NULL(unit_name);
 
-        ASSERT_OK(manager_load_startable_unit_or_warn(m, unit_name, NULL, &unit));
+        ASSERT_OK(manager_load_startable_unit_or_warn(m, unit_name, NULL, LOG_ERR, &unit));
         /* We need to start the slices as well otherwise the slice cgroups might be pruned
          * in on_cgroup_empty_event. */
         start_parent_slices(unit);
@@ -313,7 +322,7 @@ static void _test_service(const char *file, unsigned line, const char *func,
 
         ASSERT_NOT_NULL(unit_name);
 
-        ASSERT_OK(manager_load_startable_unit_or_warn(m, unit_name, NULL, &unit));
+        ASSERT_OK(manager_load_startable_unit_or_warn(m, unit_name, NULL, LOG_ERR, &unit));
         ASSERT_OK(unit_start(unit, NULL));
         check_service_result(file, line, func, m, unit, result_expected);
 }
@@ -1186,8 +1195,8 @@ static void test_exec_ambientcapabilities(Manager *m) {
          * the tests only if that's the case. Clearing all ambient
          * capabilities is fine, since we are expecting them to be unset
          * in the first place for the tests. */
-        r = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-        if (r < 0 && IN_SET(errno, EINVAL, EOPNOTSUPP, ENOSYS)) {
+        r = prctl_safe(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+        if (r < 0 && IN_SET(r, -EINVAL, -EOPNOTSUPP, -ENOSYS)) {
                 log_notice("Skipping %s, the kernel does not support ambient capabilities", __func__);
                 return;
         }

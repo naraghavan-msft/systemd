@@ -15,7 +15,6 @@
 #include "io-util.h"
 #include "log.h"
 #include "parse-util.h"
-#include "pull-common.h"
 #include "pull-job.h"
 #include "string-util.h"
 #include "strv.h"
@@ -282,7 +281,7 @@ static int pull_job_open_disk(PullJob *j) {
         }
 
         if (j->calc_checksum) {
-                r = dlopen_libcrypto(LOG_ERR);
+                r = DLOPEN_LIBCRYPTO(LOG_ERR, recommended);
                 if (r < 0)
                         return r;
 

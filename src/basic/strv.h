@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 #include "../fundamental/strv.h"   /* IWYU pragma: export */
 
@@ -85,6 +85,7 @@ int strv_consume_pair(char ***l, char *a, char *b);
 int strv_consume_prepend(char ***l, char *value);
 
 char** strv_remove(char **l, const char *s);
+char** strv_remove_strv(char **l, char *const*ll);
 char** strv_uniq(char **l);
 bool strv_is_uniq(char * const *l) _pure_;
 

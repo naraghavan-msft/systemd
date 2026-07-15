@@ -7,6 +7,8 @@ set -o pipefail
 
 SYSUPDATE=/usr/bin/systemd-sysupdate
 SYSUPDATED=/lib/systemd/systemd-sysupdated
+UPDATECTL=""
+VARLINK_SOCKET=/run/systemd/io.systemd.SysUpdate
 SECTOR_SIZES=(512 4096)
 WORKDIR="$(mktemp -d /var/tmp/test-72-XXXXXX)"
 CONFIGDIR="/run/sysupdate.d"
@@ -21,7 +23,9 @@ if [[ ! -x "$SYSUPDATE" ]]; then
     exit 77
 fi
 
-have_updatectl=$([[ -x "$SYSUPDATED" ]] && command -v updatectl)
+if [[ -x "$SYSUPDATED" ]]; then
+    UPDATECTL="$(command -v updatectl || true)"
+fi
 
 # Loopback devices may not be supported. They are used because sfdisk cannot
 # change the sector size of a file, and we want to test both 512 and 4096 byte
@@ -32,8 +36,8 @@ if [[ ! -e /dev/loop-control ]]; then
     SECTOR_SIZES=(512)
 fi
 
-# Set up sysupdated drop-in pointing at the correct definitions and setting
-# no verification of images.
+# Set up sysupdated and varlink drop-ins pointing at the correct definitions and
+# setting no verification of images.
 mkdir -p /run/systemd/system/systemd-sysupdated.service.d
 cat >/run/systemd/system/systemd-sysupdated.service.d/override.conf<<EOF
 [Service]
@@ -41,14 +45,37 @@ Environment=SYSTEMD_SYSUPDATE_NO_VERIFY=1
 Environment=SYSTEMD_ESP_PATH=${SYSTEMD_ESP_PATH}
 Environment=SYSTEMD_XBOOTLDR_PATH=${SYSTEMD_XBOOTLDR_PATH}
 EOF
+
+mkdir -p /run/systemd/system/systemd-sysupdate@.service.d
+cat >/run/systemd/system/systemd-sysupdate@.service.d/override.conf<<EOF
+[Service]
+Environment=SYSTEMD_SYSUPDATE_NO_VERIFY=1
+Environment=SYSTEMD_ESP_PATH=${SYSTEMD_ESP_PATH}
+Environment=SYSTEMD_XBOOTLDR_PATH=${SYSTEMD_XBOOTLDR_PATH}
+EOF
+
 systemctl daemon-reload
+
+SIGTEST_GPGHOME=
+SIGTEST_OTHERHOME=
 
 at_exit() {
     set +e
 
+    systemctl stop test-sysupdate-notify-recorder.socket
+    rm -f /run/systemd/system/test-sysupdate-notify-recorder.socket \
+          /run/systemd/system/test-sysupdate-notify-recorder@.service
+
     losetup -n --output NAME --associated "$BACKING_FILE" | while read -r loop_dev; do
         losetup --detach "$loop_dev"
     done
+
+    if [ "$SIGTEST_GPGHOME" != "" ]; then
+        gpgconf --homedir "$SIGTEST_GPGHOME" --kill all 2>/dev/null
+    fi
+    if [ "$SIGTEST_OTHERHOME" != "" ]; then
+        gpgconf --homedir "$SIGTEST_OTHERHOME" --kill all 2>/dev/null
+    fi
 
     rm -rf "$WORKDIR"
 }
@@ -114,9 +141,34 @@ new_version() {
     fi
 }
 
+check_no_new_update_available() {
+    local client="${1:?}"
+
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        (! "$SYSUPDATE" --verify=no check-new)
+    elif [[ "$client" == "varlink" ]]; then
+        (! varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"host"}}') |& grep io.systemd.SysUpdate.NoUpdateNeeded >/dev/null
+    else
+        exit 1
+    fi
+}
+
+check_new_update_available() {
+    local client="${1:?}"
+
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        "$SYSUPDATE" --verify=no check-new
+    elif [[ "$client" == "varlink" ]]; then
+        varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"host"}}' | grep available
+    else
+        exit 1
+    fi
+}
+
 update_now() {
     local update_type="${1:?}"
-    local checks="${2:-}"
+    local client="${2:?}"
+    local checks="${3:-}"
 
     # Update to newest version. First there should be an update ready, then we
     # do the update, and then there should not be any ready anymore
@@ -128,7 +180,7 @@ update_now() {
     # repairing an installation), so that can be overridden via the local.
 
     if [[ "$checks" != "no-checks" ]]; then
-        "$SYSUPDATE" --verify=no check-new
+        check_new_update_available "$client"
     fi
 
     if [[ "$update_type" == "monolithic" ]]; then
@@ -140,9 +192,9 @@ update_now() {
         "$SYSUPDATE" --verify=no acquire
         "$SYSUPDATE" --verify=no update
     elif [[ "$update_type" == "updatectl" ]]; then
-        if $have_updatectl; then
+        if [[ -x "$UPDATECTL" ]]; then
             systemctl start systemd-sysupdated
-            updatectl update
+            "$UPDATECTL" update
         else
             # Gracefully fall back to sysupdate
             "$SYSUPDATE" --verify=no update
@@ -152,7 +204,7 @@ update_now() {
     fi
 
     if [[ "$checks" != "no-checks" ]]; then
-        (! "$SYSUPDATE" --verify=no check-new)
+        check_no_new_update_available "$client"
     fi
 }
 
@@ -197,10 +249,11 @@ verify_version_current() {
 verify_object_fields() {
     local updatectl_output="${1:?}"
 
-    [[ "${updatectl_output}" != *"Unrecognized object field"* ]] || exit 1
+    [[ "${updatectl_output}" != *"Unrecognized object field"* ]]
 }
 
 for sector_size in "${SECTOR_SIZES[@]}"; do
+for client in sysupdate-cli varlink; do
 for update_type in monolithic split-offline split updatectl; do
     # Disk size of:
     # - 1MB for GPT
@@ -364,18 +417,18 @@ EOF
 
     # Install initial version and verify
     new_version "$sector_size" v1
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version_current "$blockdev" "$sector_size" v1 1
 
     # Create second version, update and verify that it is added
     new_version "$sector_size" v2
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v1 1
     verify_version_current "$blockdev" "$sector_size" v2 2
 
     # Create third version, update and verify it replaced the first version
     new_version "$sector_size" v3
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version_current "$blockdev" "$sector_size" v3 1
     verify_version "$blockdev" "$sector_size" v2 2
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v1+3-0.efi"
@@ -387,12 +440,12 @@ EOF
     new_version "$sector_size" v4
     rm "$WORKDIR/source/uki-extra-v4.efi"
     update_checksums
-    (! "$SYSUPDATE" --verify=no check-new)
+    check_no_new_update_available "$client"
 
     # Create a fifth version, that's complete on the server side. We should
     # completely skip the incomplete v4 and install v5 instead.
     new_version "$sector_size" v5
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
 
@@ -402,19 +455,27 @@ EOF
     # Always do this as a monolithic update for the repair to work.
     rm -r "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d"
     "$SYSUPDATE" --offline list v5 | grep "incomplete" >/dev/null
-    update_now "monolithic"
+    update_now "monolithic" "$client"
     "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
 
     # Now let's try enabling an optional feature
-    "$SYSUPDATE" features | grep "optional"
-    "$SYSUPDATE" features optional | grep "99-optional"
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        "$SYSUPDATE" features | grep "optional"
+        "$SYSUPDATE" features optional | grep "99-optional"
+    elif [[ "$client" == "varlink" ]]; then
+        [[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -r '.features[] | select(.id=="optional") | .description') == "Optional Feature" ]]
+        varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -r '.features[] | select(.id=="optional") | .transfers' | grep "99-optional"
+    else
+        exit 1
+    fi
+
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d/optional.efi"
     mkdir "$CONFIGDIR/optional.feature.d"
     echo -e "[Feature]\nEnabled=true" > "$CONFIGDIR/optional.feature.d/enable.conf"
     "$SYSUPDATE" --offline list v5 | grep "incomplete" >/dev/null
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
@@ -422,7 +483,7 @@ EOF
 
     # And now let's disable it and make sure it gets cleaned up
     rm -r "$CONFIGDIR/optional.feature.d"
-    (! "$SYSUPDATE" --verify=no check-new)
+    check_no_new_update_available "$client"
     "$SYSUPDATE" vacuum
     "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
@@ -432,19 +493,19 @@ EOF
     # Create sixth version, update using updatectl and verify it replaced the
     # correct version
     new_version "$sector_size" v6
-    if $have_updatectl; then
+    if [[ -x "$UPDATECTL" ]]; then
         systemctl start systemd-sysupdated
-        "$SYSUPDATE" --verify=no check-new
-        updatectl update |& tee "$WORKDIR"/updatectl-update-6
+        check_new_update_available "$client"
+        "$UPDATECTL" update |& tee "$WORKDIR"/updatectl-update-6
         grep "Done" "$WORKDIR"/updatectl-update-6
         (! grep "Already up-to-date" "$WORKDIR"/updatectl-update-6)
     else
         # If no updatectl, gracefully fall back to systemd-sysupdate
-        update_now "$update_type"
+        update_now "$update_type" "$client"
     fi
     # User-facing updatectl returns 0 if there's no updates, so use the low-level
     # utility to make sure we did upgrade
-    (! "$SYSUPDATE" --verify=no check-new )
+    check_no_new_update_available "$client"
     verify_version_current "$blockdev" "$sector_size" v6 1
     verify_version "$blockdev" "$sector_size" v5 2
 
@@ -452,13 +513,13 @@ EOF
     # testing for specific output, but this will at least catch obvious crashes
     # and allow updatectl to run under the various sanitizers. We create a
     # component so that updatectl has multiple targets to list.
-    if $have_updatectl; then
+    if [[ -x "$UPDATECTL" ]]; then
         mkdir -p /run/sysupdate.test.d/
         cp "$CONFIGDIR/01-first.transfer" /run/sysupdate.test.d/01-first.transfer
-        verify_object_fields "$(updatectl list 2>&1)"
-        verify_object_fields "$(updatectl list host 2>&1)"
-        verify_object_fields "$(updatectl list host@v6 2>&1)"
-        updatectl check
+        verify_object_fields "$("$UPDATECTL" list 2>&1)"
+        verify_object_fields "$("$UPDATECTL" list host 2>&1)"
+        verify_object_fields "$("$UPDATECTL" list host@v6 2>&1)"
+        "$UPDATECTL" check
         rm -r /run/sysupdate.test.d
     fi
 
@@ -497,7 +558,7 @@ MatchPattern=dir-@v
 InstancesMax=3
 EOF
 
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v6 1
     verify_version_current "$blockdev" "$sector_size" v7 2
 
@@ -520,7 +581,7 @@ EOF
     # (what .transfer files were called before v257)
     for i in "$CONFIGDIR/"*.conf; do echo mv "$i" "${i%.conf}.transfer"; done
     new_version "$sector_size" v8
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version_current "$blockdev" "$sector_size" v8 1
     verify_version "$blockdev" "$sector_size" v7 2
 
@@ -530,11 +591,11 @@ EOF
     # Vacuum the partial version, regenerate it on the server, try updating
     # again and it should succeed.
     new_version "$sector_size" v9 "corrupt-checksum"
-    (! update_now "$update_type")
+    (! update_now "$update_type" "$client")
     "$SYSUPDATE" --offline list v9 | grep "partial" >/dev/null
     verify_version_current "$blockdev" "$sector_size" v8 1
     # don’t verify the other part of the block device as it’s in an indeterminate state
-    (! update_now "$update_type" "no-checks") |& tee "$WORKDIR"/update_now-9
+    (! update_now "$update_type" "$client" "no-checks") |& tee "$WORKDIR"/update_now-9
     cat "$WORKDIR"/update_now-9
     grep "is already acquired and partially installed. Vacuum it to try installing again." "$WORKDIR"/update_now-9
     "$SYSUPDATE" --offline vacuum |& grep "Removing old partial" >/dev/null
@@ -542,13 +603,26 @@ EOF
     # don’t verify the other part of the block device as it’s in an indeterminate state
     "$SYSUPDATE" --verify=no list v9 | grep "candidate" >/dev/null
     new_version "$sector_size" v9
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v8 1
     verify_version_current "$blockdev" "$sector_size" v9 2
+
+    # Test that checking for an update on a non-existent target fails
+    # (for backwards compatibility reasons, the validation in sysupdate-cli is
+    # less strict)
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        (! "$SYSUPDATE" --verify=no check-new --component=../) |& grep "Component name invalid" >/dev/null
+    elif [[ "$client" == "varlink" ]]; then
+        (! varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"component","name":"../"}}') |& grep org.varlink.service.InvalidParameter >/dev/null
+        (! varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"component","name":"doesnotexist"}}') |& grep io.systemd.SysUpdate.NoSuchTarget >/dev/null
+    else
+        exit 1
+    fi
 
     # Cleanup
     [[ -b "$blockdev" ]] && losetup --detach "$blockdev"
     rm "$BACKING_FILE"
+done
 done
 done
 
@@ -573,8 +647,20 @@ MatchPattern=some-component_@v
 CurrentSymlink=some-component
 EOF
 "$SYSUPDATE" --json=short components | grep -F '{"default":false,"components":["some-component"]}' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets | all(.id.class != "host")' >/dev/null
 mkdir /run/sysupdate.d
 "$SYSUPDATE" --json=short components | grep -F '{"default":false,"components":["some-component"]}' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets | all(.id.class != "host")' >/dev/null
+[[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -r '.targets[0].id.name') == "some-component" ]]
+
+# Regression test for https://github.com/systemd/systemd/issues/42330 — the
+# 'pending'/'reboot' verbs and the '--reboot' switch compare the newest installed
+# version against the booted OS version (IMAGE_VERSION= from os-release), which is
+# unrelated to component versions. Selecting a component must therefore be refused
+# rather than silently performing a bogus comparison.
+(! "$SYSUPDATE" --component=some-component pending) |& grep -F 'may not be combined' >/dev/null
+(! "$SYSUPDATE" --component=some-component reboot) |& grep -F 'may not be combined' >/dev/null
+(! "$SYSUPDATE" --component=some-component update --reboot) |& grep -F 'may not be combined' >/dev/null
 
 # Clean up regression test
 rmdir /run/sysupdate.d
@@ -599,10 +685,768 @@ Path=$WORKDIR/blobs
 MatchPattern=tiny-@v.bin
 InstancesMax=1
 EOF
+
 "$SYSUPDATE" --verify=no update
 cmp "$WORKDIR/source/tiny-v1.bin" "$WORKDIR/blobs/tiny-v1.bin"
+
+# Test that listing features when none are configured gives an empty list.
+"$SYSUPDATE" features |& grep "No features." >/dev/null
+[[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -r '.features') == "[]" ]]
+
+# Cleanup
 rm "$CONFIGDIR/01-tiny-url.transfer"
 rm "$WORKDIR/source/tiny-v1.bin"
 rm "$WORKDIR/source/SHA256SUMS"
+
+# Check that malformed manifest hashes are rejected without aborting.
+rm -rf "$WORKDIR/malformed-manifest"
+mkdir -p "$WORKDIR/malformed-manifest/definitions" "$WORKDIR/malformed-manifest/source" "$WORKDIR/malformed-manifest/target"
+printf 'payload\n' >"$WORKDIR/malformed-manifest/source/malformed-v1.bin"
+hash_64=0000000000000000000000000000000000000000000000000000000000000000
+printf '%s\t\t *malformed-v1.bin\n' "${hash_64%??}" >"$WORKDIR/malformed-manifest/source/SHA256SUMS"
+cat >"$WORKDIR/malformed-manifest/definitions/01-malformed-hash.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/malformed-manifest/source
+MatchPattern=malformed-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/malformed-manifest/target
+MatchPattern=malformed-@v.bin
+InstancesMax=1
+EOF
+set +e
+"$SYSUPDATE" --definitions="$WORKDIR/malformed-manifest/definitions" --verify=no check-new &>"$WORKDIR/malformed-manifest/check-new.log"
+rc=$?
+set -e
+[[ $rc -ne 0 ]]
+[[ $rc -ne 134 ]]
+grep -F "Manifest hash at line 1 decoded to 31 bytes" "$WORKDIR/malformed-manifest/check-new.log" >/dev/null
+
+# Check the "cleanup" verb and the underlying install database. A successful
+# update must record an install database entry for every transfer that installs
+# into the file system, and those entries must cover all installed resources
+# (regular files as well as directories). Once the transfer file owning some
+# resources is removed, "systemd-sysupdate cleanup" must delete the now-orphaned
+# resources (and their install database entries), while leaving resources that
+# are still owned by a transfer file untouched.
+INSTALLDB="/var/lib/systemd/sysupdate/installdb"
+CLEANUP="$WORKDIR/cleanup"
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+mkdir -p "$CONFIGDIR" "$CLEANUP/source" "$CLEANUP/target"
+
+# The "alpha" transfer installs plain regular files, while the "beta" transfer
+# installs whole directories (each populated with a couple of files), to exercise
+# the recursive removal of orphaned directory resources during cleanup.
+cleanup_new_version() {
+    local version="${1:?}"
+    echo "$RANDOM" >"$CLEANUP/source/alpha-$version.bin"
+    rm -rf "$CLEANUP/source/beta-$version"
+    mkdir -p "$CLEANUP/source/beta-$version"
+    echo "$RANDOM" >"$CLEANUP/source/beta-$version/one.txt"
+    echo "$RANDOM" >"$CLEANUP/source/beta-$version/two.txt"
+    (cd "$CLEANUP/source" && sha256sum alpha-* >SHA256SUMS)
+}
+
+# Number of install database entries (symlinks) currently recorded.
+installdb_count() {
+    if [[ -d "$INSTALLDB" ]]; then
+        find "$INSTALLDB" -mindepth 1 -maxdepth 1 -type l | wc -l
+    else
+        echo 0
+    fi
+}
+
+# Assert that every resource (file or directory) currently installed in the
+# target directory is covered by at least one install database entry (i.e. its
+# name matches a recorded pattern that points at the target directory).
+assert_installdb_covers_target() {
+    local f base link tgt path pattern glob covered
+    for f in "$CLEANUP/target"/*; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        covered=0
+        while read -r link; do
+            tgt="$(readlink "$link")"
+            # Entries are stored as "<path>/./<pattern>".
+            path="${tgt%%/./*}"
+            pattern="${tgt#*/./}"
+            # Translate the sysupdate pattern into a shell glob (only @v is used here).
+            glob="${pattern//@v/*}"
+            # shellcheck disable=SC2053
+            if [[ "$path" == "$CLEANUP/target" && "$base" == $glob ]]; then
+                covered=1
+                break
+            fi
+        done < <(find "$INSTALLDB" -mindepth 1 -maxdepth 1 -type l)
+        [[ "$covered" -eq 1 ]] || { echo "Installed resource '$f' not covered by install database" >&2; exit 1; }
+    done
+}
+
+# Verify the installed beta-<version> directory matches its source.
+verify_beta_synced() {
+    local version="${1:?}"
+    test -d "$CLEANUP/target/beta-$version"
+    cmp "$CLEANUP/source/beta-$version/one.txt" "$CLEANUP/target/beta-$version/one.txt"
+    cmp "$CLEANUP/source/beta-$version/two.txt" "$CLEANUP/target/beta-$version/two.txt"
+}
+
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=alpha-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=alpha-@v.bin
+InstancesMax=2
+EOF
+
+cat >"$CONFIGDIR/02-beta.transfer" <<EOF
+[Source]
+Type=directory
+Path=$CLEANUP/source
+MatchPattern=beta-@v
+
+[Target]
+Type=directory
+Path=$CLEANUP/target
+MatchPattern=beta-@v
+InstancesMax=2
+EOF
+
+# Install two versions; with InstancesMax=2 both are kept for each transfer.
+cleanup_new_version v1
+"$SYSUPDATE" --verify=no update
+cleanup_new_version v2
+"$SYSUPDATE" --verify=no update
+
+# All four resources must be installed, and the directory resources must have
+# been synced over completely.
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+verify_beta_synced v1
+verify_beta_synced v2
+
+# The update must have recorded one install database entry per transfer pattern,
+# and those entries must cover every installed resource.
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Running cleanup while all transfer files are still in place must be a no-op:
+# nothing is orphaned, so nothing must be removed.
+"$SYSUPDATE" cleanup
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+verify_beta_synced v1
+verify_beta_synced v2
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Remove the transfer file owning the "beta" directories and clean up. The beta
+# directories (with all their contents) and their install database entry must be
+# removed, while the alpha files must be kept since their transfer file is still
+# in place.
+rm "$CONFIGDIR/02-beta.transfer"
+"$SYSUPDATE" cleanup
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+test ! -e "$CLEANUP/target/beta-v1"
+test ! -e "$CLEANUP/target/beta-v2"
+[[ "$(installdb_count)" -eq 1 ]]
+assert_installdb_covers_target
+
+# Now remove the remaining transfer file and clean up again. The alpha files and
+# the last install database entry must be removed too.
+rm "$CONFIGDIR/01-alpha.transfer"
+"$SYSUPDATE" cleanup
+test ! -f "$CLEANUP/target/alpha-v1.bin"
+test ! -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 0 ]]
+
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+
+# Briefly check the "--component-all" switch of the "cleanup" verb. Each component
+# keeps its own install database (installdb.<component>), and "cleanup
+# --component-all" must clean up orphaned resources across *all* of them in one
+# go. Set up two components, install a resource into each, then drop both transfer
+# files and run a single "cleanup --component-all" — it must remove both
+# components' resources (and their install database entries).
+COMPALL="$WORKDIR/component-all"
+rm -rf "$COMPALL" /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d \
+    /var/lib/systemd/sysupdate/installdb.comp-a /var/lib/systemd/sysupdate/installdb.comp-b
+mkdir -p "$COMPALL/source" "$COMPALL/target-a" "$COMPALL/target-b" \
+    /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d
+
+echo "$RANDOM" >"$COMPALL/source/comp-a-v1.bin"
+echo "$RANDOM" >"$COMPALL/source/comp-b-v1.bin"
+(cd "$COMPALL/source" && sha256sum comp-* >SHA256SUMS)
+
+cat >/run/sysupdate.comp-a.d/01-comp-a.transfer <<EOF
+[Source]
+Type=regular-file
+Path=$COMPALL/source
+MatchPattern=comp-a-@v.bin
+
+[Target]
+Type=regular-file
+Path=$COMPALL/target-a
+MatchPattern=comp-a-@v.bin
+InstancesMax=1
+EOF
+
+cat >/run/sysupdate.comp-b.d/01-comp-b.transfer <<EOF
+[Source]
+Type=regular-file
+Path=$COMPALL/source
+MatchPattern=comp-b-@v.bin
+
+[Target]
+Type=regular-file
+Path=$COMPALL/target-b
+MatchPattern=comp-b-@v.bin
+InstancesMax=1
+EOF
+
+"$SYSUPDATE" --component=comp-a --verify=no update
+"$SYSUPDATE" --component=comp-b --verify=no update
+test -f "$COMPALL/target-a/comp-a-v1.bin"
+test -f "$COMPALL/target-b/comp-b-v1.bin"
+test -d /var/lib/systemd/sysupdate/installdb.comp-a
+test -d /var/lib/systemd/sysupdate/installdb.comp-b
+
+# --component-all is only supported for the "cleanup" verb, refuse it elsewhere.
+(! "$SYSUPDATE" --component-all --verify=no update)
+
+# With the transfer files still in place "cleanup --component-all" is a no-op:
+# nothing is orphaned.
+"$SYSUPDATE" --component-all cleanup
+test -f "$COMPALL/target-a/comp-a-v1.bin"
+test -f "$COMPALL/target-b/comp-b-v1.bin"
+
+# Drop both transfer files and clean up all components at once. Both resources
+# (and their install database entries) must now be gone.
+rm /run/sysupdate.comp-a.d/01-comp-a.transfer /run/sysupdate.comp-b.d/01-comp-b.transfer
+"$SYSUPDATE" --component-all cleanup
+test ! -e "$COMPALL/target-a/comp-a-v1.bin"
+test ! -e "$COMPALL/target-b/comp-b-v1.bin"
+[[ "$(find /var/lib/systemd/sysupdate/installdb.comp-a -type l | wc -l)" -eq 0 ]]
+[[ "$(find /var/lib/systemd/sysupdate/installdb.comp-b -type l | wc -l)" -eq 0 ]]
+
+rm -rf "$COMPALL" /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d \
+    /var/lib/systemd/sysupdate/installdb.comp-a /var/lib/systemd/sysupdate/installdb.comp-b
+
+# Check the "--cleanup=" switch of the "update" verb. With "--cleanup=yes" a
+# successful update must, after installing the new version, run the equivalent of
+# the "cleanup" verb and remove any resources that are no longer owned by a
+# currently defined transfer file. Reuse the "alpha"/"beta" helpers from above.
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+mkdir -p "$CONFIGDIR" "$CLEANUP/source" "$CLEANUP/target"
+
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=alpha-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=alpha-@v.bin
+InstancesMax=2
+EOF
+
+cat >"$CONFIGDIR/02-beta.transfer" <<EOF
+[Source]
+Type=directory
+Path=$CLEANUP/source
+MatchPattern=beta-@v
+
+[Target]
+Type=directory
+Path=$CLEANUP/target
+MatchPattern=beta-@v
+InstancesMax=2
+EOF
+
+# Install a first version with both transfers in place.
+cleanup_new_version v1
+"$SYSUPDATE" --verify=no update --cleanup=yes
+test -f "$CLEANUP/target/alpha-v1.bin"
+verify_beta_synced v1
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Now drop the "beta" transfer file and install a second version with
+# "--cleanup=yes". The new alpha resource must be installed, and the now-orphaned
+# beta directory (and its install database entry) must be removed as part of the
+# same invocation, without a separate "cleanup" call.
+rm "$CONFIGDIR/02-beta.transfer"
+cleanup_new_version v2
+"$SYSUPDATE" --verify=no update --cleanup=yes
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+test ! -e "$CLEANUP/target/beta-v1"
+[[ "$(installdb_count)" -eq 1 ]]
+assert_installdb_covers_target
+
+# With "--cleanup=no" (the default) orphaned resources must be left in place.
+# Redefine the "alpha" transfer so its patterns no longer match the already
+# installed alpha files (turning them into orphans), while keeping a valid
+# transfer definition in place. Updating with "--cleanup=no" must then install
+# nothing new (there's no matching source) and leave the now-orphaned alpha files
+# and their install database entry untouched.
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=gamma-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=gamma-@v.bin
+InstancesMax=2
+EOF
+"$SYSUPDATE" --verify=no update --cleanup=no
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 1 ]]
+
+# Invoking the "cleanup" verb with "--cleanup=no" is contradictory and must be
+# refused.
+(! "$SYSUPDATE" --cleanup=no cleanup) |& grep "contradictory" >/dev/null
+
+# A plain "cleanup" must still remove the orphaned alpha files.
+"$SYSUPDATE" cleanup
+test ! -f "$CLEANUP/target/alpha-v1.bin"
+test ! -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 0 ]]
+
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+
+# Verify the notification callout: after a successful update, sysupdate must connect to every socket in
+# /run/systemd/sysupdate/notify/ and invoke io.systemd.SysUpdate.Notify.OnCompletedUpdate(). We hook a tiny
+# recorder socket into that directory that captures the request and replies with success.
+NOTIFY_LOG="$WORKDIR/notify.log"
+rm -f "$NOTIFY_LOG"
+
+cat >"$WORKDIR/notify-recorder.py" <<EOF
+#!/usr/bin/env python3
+# Minimal Varlink server: read one NUL-terminated request, record it, reply with empty parameters.
+import sys
+buf = b""
+while True:
+    c = sys.stdin.buffer.read(1)
+    if not c or c == b"\x00":
+        break
+    buf += c
+with open("$NOTIFY_LOG", "ab") as f:
+    f.write(buf + b"\n")
+sys.stdout.buffer.write(b'{"parameters":{}}\x00')
+sys.stdout.buffer.flush()
+EOF
+chmod +x "$WORKDIR/notify-recorder.py"
+
+cat >/run/systemd/system/test-sysupdate-notify-recorder.socket <<EOF
+[Socket]
+ListenStream=/run/systemd/sysupdate/notify/io.test.SysUpdateRecorder
+Accept=yes
+EOF
+
+cat >"/run/systemd/system/test-sysupdate-notify-recorder@.service" <<EOF
+[Service]
+ExecStart=$WORKDIR/notify-recorder.py
+StandardInput=socket
+StandardOutput=socket
+EOF
+
+systemctl daemon-reload
+systemctl start test-sysupdate-notify-recorder.socket
+
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"
+echo "hello" >"$WORKDIR/source/notifytest-v1.bin"
+(cd "$WORKDIR/source" && sha256sum notifytest-v1.bin >SHA256SUMS)
+cat >"$CONFIGDIR/01-notifytest.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=notifytest-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=notifytest-@v.bin
+InstancesMax=1
+EOF
+
+# A real update must trigger exactly one notification carrying the version and the updated resources.
+# The callout is synchronous (sysupdate blocks until the subscriber replied, which happens after the
+# request was recorded), so the log is fully written by the time the update returns.
+"$SYSUPDATE" --verify=no update
+test -s "$NOTIFY_LOG"  # the notification must have been recorded
+notify_line="$(tail -n1 "$NOTIFY_LOG")"
+echo "Recorded notification: $notify_line"
+jq -e '.method == "io.systemd.SysUpdate.Notify.OnCompletedUpdate"' <<<"$notify_line" >/dev/null
+jq -e '.parameters.version == "v1"' <<<"$notify_line" >/dev/null
+jq -e '.parameters.resources | length >= 1' <<<"$notify_line" >/dev/null
+jq -e '.parameters.resources | all(has("transfer"))' <<<"$notify_line" >/dev/null
+
+# A no-op update ("No update needed") must NOT emit a notification.
+rm -f "$NOTIFY_LOG"
+"$SYSUPDATE" --verify=no update
+test ! -s "$NOTIFY_LOG"
+
+systemctl stop test-sysupdate-notify-recorder.socket
+rm -f /run/systemd/system/test-sysupdate-notify-recorder.socket \
+      /run/systemd/system/test-sysupdate-notify-recorder@.service
+systemctl daemon-reload
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+rm -f "$WORKDIR/source/notifytest-v1.bin" "$WORKDIR/source/SHA256SUMS" \
+      "$WORKDIR/notify-recorder.py" "$NOTIFY_LOG"
+
+test_signature_verification() {
+    if ! command -v gpg >/dev/null; then
+        echo "gpg not available, skipping signature verification test"
+        return 0
+    fi
+
+    # Checking for --auto-key-import is not enough because the merge-only/import-clean guarantee we rely on
+    # only works correctly with gpg 2.4
+    local gpg_version gpg_rest
+    gpg_version="$(gpg --version | sed -n '1p' | awk '{print $NF}')"
+    gpg_rest="${gpg_version#*.}"
+    if [ "${gpg_version%%.*}" -lt 2 ] || { [ "${gpg_version%%.*}" -eq 2 ] && [ "${gpg_rest%%.*}" -lt 4 ]; }; then
+        echo "gpg $gpg_version too old (need >= 2.4), skipping signature verification test"
+        return 0
+    fi
+
+    local sigdir="$WORKDIR/sigtest-source"
+    local defdir="$WORKDIR/sigtest-defs"
+    local gpghome="$WORKDIR/sigtest-gpghome"
+    local other_home="$WORKDIR/sigtest-otherhome"
+    local target="$WORKDIR/sigtest-target"
+    local keyring="$WORKDIR/sigtest-keyring"
+    local top_fpr keys
+
+    SIGTEST_GPGHOME="$gpghome"
+    SIGTEST_OTHERHOME="$other_home"
+
+    mkdir -p "$sigdir" "$defdir" "$gpghome" "$other_home" "$target"
+    chmod 700 "$gpghome" "$other_home"
+
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Test Key <test@example.com>' rsa2048 cert,sign never
+    # Capture gpg output first, then grep from a here-string to avoid grep -m1 causing a SIGPIPE
+    keys="$(GNUPGHOME="$gpghome" gpg --list-keys --with-colons)"
+    top_fpr="$(grep -m1 '^fpr:' <<< "$keys" | cut -d: -f10)"
+    test "$top_fpr" != ""
+
+    GNUPGHOME="$gpghome" gpg --export --output "$keyring"
+
+    dd if=/dev/urandom of="$sigdir/payload-v1.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw > SHA256SUMS)
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+
+    cat >"$defdir/01-sigtest.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$sigdir
+MatchPattern=payload-@v.raw
+
+[Target]
+Type=regular-file
+Path=$target
+MatchPattern=payload-@v.raw
+InstancesMax=3
+EOF
+
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" check-new
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" update
+    cmp "$sigdir/payload-v1.raw" "$target/payload-v1.raw"
+
+    # Negative test: Sign with a key not in the keyring
+    GNUPGHOME="$other_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Other Key <other@example.com>' rsa2048 cert,sign never
+    dd if=/dev/urandom of="$sigdir/payload-v2.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw payload-v2.raw > SHA256SUMS)
+    GNUPGHOME="$other_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    if SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" update; then
+        echo "ERROR: accepted an update signed by a key not in the keyring" >&2
+        exit 1
+    fi
+    if [ -f "$target/payload-v2.raw" ]; then
+        echo "ERROR: payload-v2 should not have been installed" >&2
+        exit 1
+    fi
+
+    # Sub key test: Add a sub key the client does not have and rely on gpg
+    # --auto-key-import to get it from the signature.
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-add-key "$top_fpr" rsa2048 sign 1y
+    # Make it so that only the sub key is available for signing to avoid having
+    # to select it by fingerprint.
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --output "$WORKDIR/sigtest-subkey-secret.gpg" \
+        --export-secret-subkeys
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --yes --delete-secret-keys "$top_fpr"
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --import "$WORKDIR/sigtest-subkey-secret.gpg"
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" update
+    cmp "$sigdir/payload-v2.raw" "$target/payload-v2.raw"
+}
+
+test_signature_verification
+
+# Test '**/' as prefix in MatchPattern= for subpaths in SHA256SUMS
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/sub"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/sub"
+
+printf '1234567' >"$WORKDIR/source/sub/blob-v10.bin"
+printf 'abcdefg' >"$WORKDIR/source/sub/blob-v11.bin"
+(cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && sha256sum sub/blob-*.bin >SHA256SUMS)
+
+# A regular-file source where '**/' descends into sub/ to match against the basename
+cat >"$CONFIGDIR/01-basename-dir.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/sub/blob-v11.bin" "$WORKDIR/blobs/blob-v11.bin"
+[[ "$("$SYSUPDATE" --verify=no list v11 | grep -c "Version: v11")" == "1" ]]
+rm "$CONFIGDIR/01-basename-dir.transfer"
+
+# A url-file source pulled via file:// using SHA256SUMS with "sub/blob-v1x.bin" entries
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+cat >"$CONFIGDIR/01-basename-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/sub/blob-v11.bin" "$WORKDIR/blobs/blob-v11.bin"
+rm "$CONFIGDIR/01-basename-url.transfer"
+
+# A pattern that spells out the subdir literally should also work for url sources
+# for parity with regular-file sources
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+cat >"$CONFIGDIR/01-explicit-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=sub/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/sub/blob-v11.bin" "$WORKDIR/blobs/blob-v11.bin"
+rm "$CONFIGDIR/01-explicit-url.transfer"
+
+# Rejection test for a manifest entry containing ".."
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/source/sub/nested"
+cp "$WORKDIR/source/SHA256SUMS" "$WORKDIR/source/SHA256SUMS.bak"
+sed -i 's,sub/,sub/nested/../,g' "$WORKDIR/source/SHA256SUMS"
+cat >"$CONFIGDIR/01-basename-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+EOF
+if "$SYSUPDATE" --verify=no update |& tee "$WORKDIR/traversal.log"; then
+    echo "ERROR: accepted a manifest entry with a '..' path traversal" >&2
+    exit 1
+fi
+grep "Invalid filename" "$WORKDIR/traversal.log" >/dev/null
+mv "$WORKDIR/source/SHA256SUMS.bak" "$WORKDIR/source/SHA256SUMS"
+rm "$CONFIGDIR/01-basename-url.transfer"
+
+# Rejection test for a manifest entry with a percent-encoded ".." which curl would
+# decode when pulling via file://, escaping the source dir past path_is_normalized()
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+cp "$WORKDIR/source/SHA256SUMS" "$WORKDIR/source/SHA256SUMS.bak"
+sed -i 's,sub/,sub/nested/%2e%2e/,g' "$WORKDIR/source/SHA256SUMS"
+cat >"$CONFIGDIR/01-basename-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+EOF
+if "$SYSUPDATE" --verify=no update |& tee "$WORKDIR/percent.log"; then
+    echo "ERROR: accepted a manifest entry with a percent-encoded '..' path traversal" >&2
+    exit 1
+fi
+grep "Invalid filename" "$WORKDIR/percent.log" >/dev/null
+mv "$WORKDIR/source/SHA256SUMS.bak" "$WORKDIR/source/SHA256SUMS"
+rm "$CONFIGDIR/01-basename-url.transfer"
+
+# A MatchPattern= with two subdirectory levels must descend beyond the first level
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/depth-v3"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/depth-v3/contents"
+printf 'version-three' >"$WORKDIR/source/depth-v3/contents/image.raw"
+cat >"$CONFIGDIR/01-depth.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=depth-@v/contents/image.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=depth-@v.raw
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/depth-v3/contents/image.raw" "$WORKDIR/blobs/depth-v3.raw"
+rm -rf "$CONFIGDIR/01-depth.transfer" "$WORKDIR/source/depth-v3"
+
+# Pattern matching should not depend on the pattern order. A transfer can list one pattern per repository
+# layout, e.g., when a source switches from one directory per version (bundle-v1/image.raw) to flat files
+# (bundle-v2.raw) and both layouts coexist during a migration.
+# Check that after a subdirectory pattern which descends we still can match a top-level file through a
+# '**/' pattern.
+# Also check that after a non-matching '**/' pattern we still can match a plain top-level file.
+# Then check that after a subdirectory pattern we can still match a plain top-level file.
+# The first and last work because the wildcard field also captures the '.raw' suffix, so the top-level file
+# matches the directory component of the subdirectory pattern and triggers the descend-retry logic.
+# The fourth transfer checks the vice versa migration where one directory per version is the new layout and
+# the old versions are flat files without a suffix: the directory name fully matches the flat pattern but
+# must still be descended into for the subdirectory pattern.
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/bundle-v1" "$WORKDIR/source/pack-v2"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"/{glob-last,glob-first,subdir-first,yes-and-retry} \
+         "$WORKDIR/source/bundle-v1" "$WORKDIR/source/pack-v2"
+echo 'version-one' >"$WORKDIR/source/bundle-v1/image.raw"
+echo 'version-two' >"$WORKDIR/source/bundle-v2.raw"
+echo 'version-v1' >"$WORKDIR/source/pack-v1"
+echo 'version-v2' >"$WORKDIR/source/pack-v2/image.raw"
+cat >"$CONFIGDIR/01-glob-last.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=bundle-@v/image.raw **/bundle-@v.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/glob-last
+MatchPattern=bundle-@v.raw
+InstancesMax=1
+EOF
+cat >"$CONFIGDIR/02-glob-first.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=**/bundle-@v.img bundle-@v.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/glob-first
+MatchPattern=bundle-@v.raw
+InstancesMax=1
+EOF
+cat >"$CONFIGDIR/03-subdir-first.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=bundle-@v/image.raw bundle-@v.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/subdir-first
+MatchPattern=bundle-@v.raw
+InstancesMax=1
+EOF
+cat >"$CONFIGDIR/04-yes-and-retry.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=pack-@v/image.raw pack-@v
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/yes-and-retry
+MatchPattern=pack-@v
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+for target in glob-last glob-first subdir-first; do
+    cmp "$WORKDIR/source/bundle-v2.raw" "$WORKDIR/blobs/$target/bundle-v2.raw"
+done
+cmp "$WORKDIR/source/pack-v2/image.raw" "$WORKDIR/blobs/yes-and-retry/pack-v2"
+rm -rf "$CONFIGDIR"/{01-glob-last,02-glob-first,03-subdir-first,04-yes-and-retry}.transfer \
+       "$WORKDIR/source/bundle-v2.raw" "$WORKDIR/source/bundle-v1" \
+       "$WORKDIR/source/pack-v1" "$WORKDIR/source/pack-v2"
+
+# A manifest entry that both directly matches a flat pattern and prefix-matches a subdirectory pattern
+# must be downloaded, here the flat file is the newest version (this exercises YES_AND_RETRY)
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/pack-v1"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/pack-v1"
+echo 'version-v1' >"$WORKDIR/source/pack-v1/image.raw"
+echo 'version-v2' >"$WORKDIR/source/pack-v2"
+(cd "$WORKDIR/source" && sha256sum pack-v1/image.raw pack-v2 >SHA256SUMS)
+cat >"$CONFIGDIR/01-manifest-yes-and-retry.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=pack-@v/image.raw pack-@v
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=pack-@v
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/pack-v2" "$WORKDIR/blobs/pack-v2"
+rm -rf "$CONFIGDIR/01-manifest-yes-and-retry.transfer" \
+       "$WORKDIR/source/pack-v1" "$WORKDIR/source/pack-v2"
+
+# Test that listing components/targets when none are configured gives an empty list.
+"$SYSUPDATE" components |& grep "No components defined." >/dev/null
+[[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -r '.targets') == "[]" ]]
 
 touch /testok

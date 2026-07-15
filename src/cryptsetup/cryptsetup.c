@@ -18,6 +18,7 @@
 #include "cryptsetup-pkcs11.h"
 #include "cryptsetup-tpm2.h"
 #include "cryptsetup-util.h"
+#include "dlopen-note.h"
 #include "efi-api.h"
 #include "efi-loader.h"
 #include "efivars.h"
@@ -538,7 +539,7 @@ static int parse_one_option(const char *option) {
 #if HAVE_OPENSSL
                 _cleanup_strv_free_ char **l = NULL;
 
-                r = dlopen_libcrypto(LOG_ERR);
+                r = DLOPEN_LIBCRYPTO(LOG_ERR, recommended);
                 if (r < 0)
                         return r;
 
@@ -2053,6 +2054,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                         arg_tpm2_pcr_mask == UINT32_MAX ? TPM2_PCR_MASK_DEFAULT_LEGACY : arg_tpm2_pcr_mask,
                                         UINT16_MAX,
                                         /* pubkey= */ NULL,
+                                        /* pubkey_policy_ref= */ NULL,
                                         /* pubkey_pcr_mask= */ 0,
                                         /* signature_path= */ NULL,
                                         /* pcrlock_path= */ NULL,
@@ -2068,6 +2070,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                         until,
                                         "cryptsetup.tpm2-pin",
                                         arg_ask_password_flags,
+                                        /* argon2id_params= */ NULL,
                                         &decrypted_key);
                         if (r >= 0)
                                 break;
@@ -2108,10 +2111,12 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
 
                         for (;;) {
                                 _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+                                _cleanup_free_ char *pubkey_policy_ref = NULL;
                                 struct iovec *blobs = NULL, *policy_hash = NULL;
                                 uint32_t hash_pcr_mask, pubkey_pcr_mask;
                                 size_t n_blobs = 0, n_policy_hash = 0;
                                 uint16_t pcr_bank, primary_alg;
+                                Argon2IdParameters argon2id_params = {};
                                 TPM2Flags tpm2_flags;
 
                                 CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
@@ -2124,6 +2129,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 &hash_pcr_mask,
                                                 &pcr_bank,
                                                 &pubkey,
+                                                &pubkey_policy_ref,
                                                 &pubkey_pcr_mask,
                                                 &primary_alg,
                                                 &blobs,
@@ -2135,7 +2141,8 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 &pcrlock_nv,
                                                 &tpm2_flags,
                                                 &keyslot,
-                                                &token);
+                                                &token,
+                                                &argon2id_params);
                                 if (r == -ENXIO)
                                         /* No further TPM2 tokens found in the LUKS2 header. */
                                         return log_full_errno(found_some ? LOG_NOTICE : LOG_DEBUG,
@@ -2158,6 +2165,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 hash_pcr_mask,
                                                 pcr_bank,
                                                 &pubkey,
+                                                pubkey_policy_ref,
                                                 pubkey_pcr_mask,
                                                 arg_tpm2_signature,
                                                 arg_tpm2_pcrlock,
@@ -2174,10 +2182,14 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 until,
                                                 "cryptsetup.tpm2-pin",
                                                 arg_ask_password_flags,
+                                                &argon2id_params,
                                                 &decrypted_key);
                                 if (IN_SET(r, -EACCES, -ENOLCK))
                                         return log_notice_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 PIN unlock failed, falling back to traditional unlocking.");
-                                if (r != -EPERM)
+                                /* Stop unless we should keep iterating to next token because the tried one
+                                 * does not match boot state. For now without -EUCLEAN because currently the
+                                 * only error it reports won't be solved by moving to another token. */
+                                if (!ERRNO_IS_NEG_TPM2_TOKEN_MISMATCH(r))
                                         break;
 
                                 token++; /* try a different token next time */
@@ -2639,6 +2651,9 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         /* A delicious drop of snake oil */
         (void) safe_mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT);
 
+        /* Only erase key files explicitly configured on the command line, never the ones we
+         * auto-discover in /etc/cryptsetup-keys.d/ and /run/cryptsetup-keys.d/: those are shared
+         * resources not owned by an individual volume. (key_file is NULL when auto-discovery is used.) */
         if (key_file && arg_keyfile_erase)
                 destroy_key_file = key_file; /* let's get this baby erased when we leave */
 
@@ -2752,6 +2767,8 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
                                 return r;
                         if (r > 0)
                                 key_data = &discovered_key_data;
+                        else
+                                try_discover_key = false;
                 }
 
                 if (token_type < 0 && !key_file && !key_data && !passwords) {
@@ -2872,6 +2889,12 @@ static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) 
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBBLKID_NOTE(recommended);
+        LIBFIDO2_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBP11KIT_NOTE(suggested);
+        TPM2_NOTE(suggested);
+
         log_setup();
 
         umask(0022);
@@ -2881,7 +2904,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = dlopen_cryptsetup(LOG_ERR);
+        r = DLOPEN_CRYPTSETUP(LOG_ERR, required);
         if (r < 0)
                 return r;
 

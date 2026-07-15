@@ -9,7 +9,7 @@
 #include <sys/ioprio.h>
 #include <sys/keyctl.h>
 #include <sys/mount.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -33,6 +33,7 @@
 #include "constants.h"
 #include "copy.h"
 #include "coredump-util.h"
+#include "crypto-util.h"
 #include "cryptsetup-util.h"
 #include "dissect-image.h"
 #include "dynamic-user.h"
@@ -889,7 +890,7 @@ static int get_supplementary_groups(
         assert(ret_gids);
 
         /*
-         * If user is given, then lookup GID and supplementary groups list.
+         * If user is given, then look up GID and supplementary groups list.
          * We avoid NSS lookups for gid=0. Also we have to initialize groups
          * here and as early as possible so we keep the list of supplementary
          * groups of the caller.
@@ -897,15 +898,16 @@ static int get_supplementary_groups(
         bool keep_groups = false;
         if (user && gid_is_valid(gid) && gid != 0) {
                 /* First step, initialize groups from /etc/groups */
-                if (initgroups(user, gid) < 0) {
+                r = initgroups_wrapper(user, gid);
+                if (r < 0) {
                         /* If our primary gid is already the one specified in Group= (i.e. we're running in
                          * user mode), gracefully handle the case where we have no privilege to re-initgroups().
                          *
                          * Note that group memberships of the current user might have been modified, but
                          * the change will only take effect after re-login. It's better to continue on with
                          * existing credentials rather than erroring out. */
-                        if (!ERRNO_IS_PRIVILEGE(errno) || gid != getgid())
-                                return -errno;
+                        if (!ERRNO_IS_PRIVILEGE(r) || gid != getgid())
+                                return r;
                 }
 
                 keep_groups = true;
@@ -916,33 +918,29 @@ static int get_supplementary_groups(
                 return 0;
         }
 
-        /*
-         * If SupplementaryGroups= was passed then NGROUPS_MAX has to
-         * be positive, otherwise fail.
-         */
-        errno = 0;
-        int ngroups_max = (int) sysconf(_SC_NGROUPS_MAX);
-        if (ngroups_max <= 0)
-                return errno_or_else(EOPNOTSUPP);
-
-        _cleanup_free_ gid_t *l_gids = new(gid_t, ngroups_max);
-        if (!l_gids)
-                return -ENOMEM;
+        /* If SupplementaryGroups= was passed then NGROUPS_MAX has to be positive, otherwise fail. */
+        _cleanup_free_ gid_t *l_gids = NULL;
 
         int k = 0;
         if (keep_groups) {
-                /*
-                 * Lookup the list of groups that the user belongs to, we
-                 * avoid NSS lookups here too for gid=0.
-                 */
-                k = ngroups_max;
-                if (getgrouplist(user, gid, l_gids, &k) < 0)
-                        return -EINVAL;
+                /* Look up the list of groups that the user belongs to.
+                 * We avoid NSS lookups here too for gid=0. */
+
+                k = getgrouplist_malloc(user, gid, &l_gids);
+                if (k < 0)
+                        return k;
         }
+
+        int ngroups_max = sysconf_ngroups_max();
+        if (ngroups_max < 0)
+                return ngroups_max;
 
         STRV_FOREACH(i, c->supplementary_groups) {
                 if (k >= ngroups_max)
                         return -E2BIG;
+
+                if (!GREEDY_REALLOC(l_gids, k + 1))
+                        return -ENOMEM;
 
                 r = get_group_creds(*i, /* flags= */ 0, /* ret_name= */ NULL, l_gids + k);
                 if (r < 0)
@@ -956,12 +954,11 @@ static int get_supplementary_groups(
                 return 0;
         }
 
-        /* Otherwise get the final list of supplementary groups */
-        gid_t *groups = newdup(gid_t, l_gids, k);
-        if (!groups)
-                return -ENOMEM;
+        /* We *could* trim the array size with realloc(3), but right now the only caller frees the array
+         * quickly anyway, so this is not worth the trouble. If other users pop up, this should be
+         * reconsidered. */
 
-        *ret_gids = groups;
+        *ret_gids = TAKE_PTR(l_gids);
         return k;
 }
 
@@ -986,19 +983,20 @@ static int enforce_groups(gid_t gid, const gid_t *supplementary_gids, int ngids)
 
 static int set_securebits(unsigned bits, unsigned mask) {
         unsigned applied;
-        int current;
+        int current, r;
 
-        current = prctl(PR_GET_SECUREBITS);
+        current = prctl_safe(PR_GET_SECUREBITS, 0, 0, 0, 0);
         if (current < 0)
-                return -errno;
+                return current;
 
         /* Clear all securebits defined in mask and set bits */
         applied = ((unsigned) current & ~mask) | bits;
         if ((unsigned) current == applied)
                 return 0;
 
-        if (prctl(PR_SET_SECUREBITS, applied) < 0)
-                return -errno;
+        r = prctl_safe(PR_SET_SECUREBITS, applied, 0, 0, 0);
+        if (r < 0)
+                return r;
 
         return 1;
 }
@@ -1089,7 +1087,7 @@ static int ask_password_conv(
 
                                 if (creds_dir) {
                                         if (setenv("CREDENTIALS_DIRECTORY", creds_dir, /* overwrite= */ true) < 0)
-                                                return log_error_errno(r, "Failed to set $CREDENTIALS_DIRECTORY: %m");
+                                                return log_error_errno(errno, "Failed to set $CREDENTIALS_DIRECTORY: %m");
                                 } else
                                         (void) unsetenv("CREDENTIALS_DIRECTORY");
 
@@ -1313,7 +1311,7 @@ static int setup_pam(
          * parent process will exec() the actual daemon. We do things this way to ensure that the main PID of
          * the daemon is the one we initially fork()ed. */
 
-        r = dlopen_libpam(LOG_ERR);
+        r = DLOPEN_LIBPAM(LOG_ERR, recommended);
         if (r < 0)
                 return r;
 
@@ -1411,7 +1409,8 @@ static int setup_pam(
                 /* Wait until our parent died. This will only work if the above setresuid() succeeds,
                  * otherwise the kernel will not allow unprivileged parents kill their privileged children
                  * this way. We rely on the control groups kill logic to do the rest for us. */
-                if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0)
+                r = prctl_safe(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+                if (r < 0)
                         goto child_finish;
 
                 /* Tell the parent that our setup is done. This is especially important regarding dropping
@@ -1579,7 +1578,7 @@ static bool seccomp_allows_drop_privileges(const ExecContext *c) {
         assert(c);
 
         /* No libseccomp, all is fine */
-        if (dlopen_libseccomp(LOG_DEBUG) < 0)
+        if (DLOPEN_LIBSECCOMP(LOG_DEBUG, recommended) < 0)
                 return true;
 
         /* No syscall filter, we are allowed to drop privileges */
@@ -1717,13 +1716,13 @@ static int apply_memory_deny_write_execute(const ExecContext *c, const ExecParam
                 return 0;
 
         /* use prctl() if kernel supports it (6.3) */
-        r = prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0);
+        r = prctl_safe(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0);
         if (r == 0) {
                 log_debug("Enabled MemoryDenyWriteExecute= with PR_SET_MDWE");
                 return 0;
         }
-        if (r < 0 && errno != EINVAL)
-                return log_debug_errno(errno, "Failed to enable MemoryDenyWriteExecute= with PR_SET_MDWE: %m");
+        if (r < 0 && r != -EINVAL)
+                return log_debug_errno(r, "Failed to enable MemoryDenyWriteExecute= with PR_SET_MDWE: %m");
         /* else use seccomp */
         log_debug("Kernel doesn't support PR_SET_MDWE: falling back to seccomp");
 
@@ -1889,7 +1888,7 @@ static int apply_restrict_filesystems(const ExecContext *c, const ExecParameters
         }
 
         /* We are in a new binary, so dl-open again */
-        r = dlopen_bpf(LOG_DEBUG);
+        r = DLOPEN_BPF(LOG_DEBUG, recommended);
         if (r < 0)
                 return r;
 
@@ -3718,8 +3717,9 @@ static int pin_rootfs(
         if (context->root_image) {
                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
 
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               context->root_image,
                               pick_filter_image_raw,
                               ELEMENTSOF(pick_filter_image_raw),
@@ -3759,8 +3759,9 @@ static int pin_rootfs(
         if (context->root_directory) {
                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
 
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               context->root_directory,
                               pick_filter_image_dir,
                               ELEMENTSOF(pick_filter_image_dir),
@@ -3788,8 +3789,9 @@ static int pin_rootfs(
         if (context->root_mstack) {
                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
 
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               context->root_mstack,
                               pick_filter_image_mstack,
                               /* n_filters= */ 1,
@@ -4850,15 +4852,15 @@ static int set_memory_thp(ExecMemoryTHP thp) {
                 return 0;
 
         case EXEC_MEMORY_THP_DISABLE:
-                r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0));
+                r = prctl_safe(PR_SET_THP_DISABLE, 1, 0, 0, 0);
                 break;
 
         case EXEC_MEMORY_THP_MADVISE:
-                r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0));
+                r = prctl_safe(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0);
                 break;
 
         case EXEC_MEMORY_THP_SYSTEM:
-                r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0));
+                r = prctl_safe(PR_SET_THP_DISABLE, 0, 0, 0, 0);
                 break;
 
         default:
@@ -5642,8 +5644,10 @@ int exec_invoke(
 
         if (mpol_is_valid(numa_policy_get_type(&context->numa_policy))) {
                 r = apply_numa_policy(&context->numa_policy);
-                if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                if (r == -ENOSYS)
                         log_debug_errno(r, "NUMA support not available, ignoring.");
+                else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        log_warning_errno(r, "NUMA policy not supported by kernel, ignoring.");
                 else if (r < 0) {
                         *exit_status = EXIT_NUMA_POLICY;
                         return log_error_errno(r, "Failed to set NUMA memory policy: %m");
@@ -5656,11 +5660,13 @@ int exec_invoke(
                         return log_error_errno(errno, "Failed to set up IO scheduling priority: %m");
                 }
 
-        if (context->timer_slack_nsec != NSEC_INFINITY)
-                if (prctl(PR_SET_TIMERSLACK, context->timer_slack_nsec) < 0) {
+        if (context->timer_slack_nsec != NSEC_INFINITY) {
+                r = prctl_safe(PR_SET_TIMERSLACK, context->timer_slack_nsec, 0, 0, 0);
+                if (r < 0) {
                         *exit_status = EXIT_TIMERSLACK;
-                        return log_error_errno(errno, "Failed to set up timer slack: %m");
+                        return log_error_errno(r, "Failed to set up timer slack: %m");
                 }
+        }
 
         if (context->personality != PERSONALITY_INVALID) {
                 r = safe_personality(context->personality);
@@ -5670,15 +5676,17 @@ int exec_invoke(
                 }
         }
 
-        if (context->memory_ksm >= 0)
-                if (prctl(PR_SET_MEMORY_MERGE, context->memory_ksm, 0, 0, 0) < 0) {
-                        if (ERRNO_IS_NOT_SUPPORTED(errno))
-                                log_debug_errno(errno, "KSM support not available, ignoring.");
+        if (context->memory_ksm >= 0) {
+                r = prctl_safe(PR_SET_MEMORY_MERGE, context->memory_ksm, 0, 0, 0);
+                if (r < 0) {
+                        if (ERRNO_IS_NOT_SUPPORTED(r))
+                                log_debug_errno(r, "KSM support not available, ignoring.");
                         else {
                                 *exit_status = EXIT_KSM;
-                                return log_error_errno(errno, "Failed to set KSM: %m");
+                                return log_error_errno(r, "Failed to set KSM: %m");
                         }
                 }
+        }
 
         r = set_memory_thp(context->memory_thp);
         if (r == -EOPNOTSUPP)
@@ -5998,10 +6006,12 @@ int exec_invoke(
         }
 
         /* Load a bunch of libraries we'll possibly need later, before we turn off dlopen() */
-        (void) dlopen_bpf(LOG_DEBUG);
-        (void) dlopen_cryptsetup(LOG_DEBUG);
-        (void) dlopen_libmount(LOG_DEBUG);
-        (void) dlopen_libseccomp(LOG_DEBUG);
+        (void) DLOPEN_BPF(LOG_DEBUG, recommended);
+        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBSECCOMP(LOG_DEBUG, recommended);
+        /* Needed for userspace verity verification fallback */
+        (void) DLOPEN_LIBCRYPTO(LOG_DEBUG, recommended);
 
         /* Let's now disable further dlopen()ing of libraries, since we are about to do namespace
          * shenanigans, and do not want to mix resources from host and namespace */
@@ -6012,8 +6022,10 @@ int exec_invoke(
                  * Users with CAP_SYS_ADMIN can set up user namespaces last because they will be able to
                  * set up all of the other namespaces (i.e. network, mount, UTS) without a user namespace. */
 
-                if (context->user_namespace_path && runtime->shared->userns_storage_socket[0] >= 0)
+                if (context->user_namespace_path && runtime->shared->userns_storage_socket[0] >= 0) {
+                        *exit_status = EXIT_USER;
                         return log_error_errno(SYNTHETIC_ERRNO(EPERM), "UserNamespacePath= is configured, but user namespace setup not permitted");
+                }
 
                 PrivateUsers pu = exec_context_get_effective_private_users(context, params);
                 if (pu == PRIVATE_USERS_NO)
@@ -6098,12 +6110,16 @@ int exec_invoke(
          * case of mount namespaces being less privileged when the mount point list is copied from a
          * different user namespace). */
         if (needs_sandboxing && context->user_namespace_path && runtime->shared && runtime->shared->userns_storage_socket[0] >= 0) {
-                if (!namespace_type_supported(NAMESPACE_USER))
+                if (!namespace_type_supported(NAMESPACE_USER)) {
+                        *exit_status = EXIT_USER;
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "UserNamespacePath= is not supported, refusing.");
+                }
 
                 r = setup_shareable_ns(runtime->shared->userns_storage_socket, CLONE_NEWUSER);
-                if (ERRNO_IS_NEG_PRIVILEGE(r))
-                        return log_notice_errno(r, "PrivateUsers= is configured, but user namespace setup not permitted, refusing.");
+                if (ERRNO_IS_NEG_PRIVILEGE(r)) {
+                        *exit_status = EXIT_USER;
+                        return log_error_errno(r, "UserNamespacePath= is configured, but user namespace setup not permitted, refusing.");
+                }
                 if (r < 0) {
                         *exit_status = EXIT_USER;
                         return log_error_errno(r, "Failed to set up user namespacing: %m");
@@ -6311,9 +6327,10 @@ int exec_invoke(
                     seccomp_allows_drop_privileges(context)) {
                         keep_seccomp_privileges = true;
 
-                        if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
+                        r = prctl_safe(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+                        if (r < 0) {
                                 *exit_status = EXIT_USER;
-                                return log_error_errno(errno, "Failed to enable keep capabilities flag: %m");
+                                return log_error_errno(r, "Failed to enable keep capabilities flag: %m");
                         }
 
                         /* Save the current bounding set so we can restore it after applying the seccomp
@@ -6446,7 +6463,8 @@ int exec_invoke(
                 /* PR_GET_SECUREBITS is not privileged, while PR_SET_SECUREBITS is. So to suppress potential
                  * EPERMs we'll try not to call PR_SET_SECUREBITS unless necessary. Setting securebits
                  * requires CAP_SETPCAP. */
-                if (prctl(PR_GET_SECUREBITS) != secure_bits) {
+                r = prctl_safe(PR_GET_SECUREBITS, 0, 0, 0, 0);
+                if (r != secure_bits) {
                         /* CAP_SETPCAP is required to set securebits. This capability is raised into the
                          * effective set here.
                          *
@@ -6463,17 +6481,21 @@ int exec_invoke(
                                 *exit_status = EXIT_CAPABILITIES;
                                 return log_error_errno(r, "Failed to gain CAP_SETPCAP for setting secure bits");
                         }
-                        if (prctl(PR_SET_SECUREBITS, secure_bits) < 0) {
+
+                        r = prctl_safe(PR_SET_SECUREBITS, secure_bits, 0, 0, 0);
+                        if (r < 0) {
                                 *exit_status = EXIT_SECUREBITS;
-                                return log_error_errno(errno, "Failed to set process secure bits: %m");
+                                return log_error_errno(r, "Failed to set process secure bits: %m");
                         }
                 }
 
-                if (context_has_no_new_privileges(context))
-                        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+                if (context_has_no_new_privileges(context)) {
+                        r = proc_set_nnp();
+                        if (r < 0) {
                                 *exit_status = EXIT_NO_NEW_PRIVILEGES;
-                                return log_error_errno(errno, "Failed to disable new privileges: %m");
+                                return log_error_errno(r, "Failed to disable new privileges: %m");
                         }
+                }
 
 #if HAVE_SECCOMP
                 r = apply_address_families(context, params);
@@ -6603,9 +6625,10 @@ int exec_invoke(
                                 }
                         }
 
-                        if (prctl(PR_SET_KEEPCAPS, 0) < 0) {
+                        r = prctl_safe(PR_SET_KEEPCAPS, 0, 0, 0, 0);
+                        if (r < 0) {
                                 *exit_status = EXIT_USER;
-                                return log_error_errno(errno, "Failed to drop keep capabilities flag: %m");
+                                return log_error_errno(r, "Failed to drop keep capabilities flag: %m");
                         }
                 }
 #endif

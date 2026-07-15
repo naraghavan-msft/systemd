@@ -370,7 +370,7 @@ label-id: 1D2CE291-7CCE-4F7D-BC83-FDB49AD74EBD
 device: $imgs/zzz
 unit: sectors
 first-lba: 2048
-last-lba: 6422494
+last-lba: 6422487
 $imgs/zzz1 : start=        2048, size=      591856, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915, uuid=4980595D-D74A-483A-AA9E-9903879A0EE5, name=\"home-first\", attrs=\"GUID:59\"
 $imgs/zzz2 : start=      593904, size=      591856, type=${root_guid}, uuid=${root_uuid}, name=\"root-${architecture}\", attrs=\"GUID:59\"
 $imgs/zzz3 : start=     1185760, size=      591864, type=${root_guid}, uuid=${root_uuid2}, name=\"root-${architecture}-2\", attrs=\"GUID:59\"
@@ -434,7 +434,7 @@ label-id: 1D2CE291-7CCE-4F7D-BC83-FDB49AD74EBD
 device: $imgs/zzz
 unit: sectors
 first-lba: 2048
-last-lba: 6553566
+last-lba: 6553559
 $imgs/zzz1 : start=        2048, size=      591856, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915, uuid=4980595D-D74A-483A-AA9E-9903879A0EE5, name=\"home-first\", attrs=\"GUID:59\"
 $imgs/zzz2 : start=      593904, size=      591856, type=${root_guid}, uuid=${root_uuid}, name=\"root-${architecture}\", attrs=\"GUID:59\"
 $imgs/zzz3 : start=     1185760, size=      591864, type=${root_guid}, uuid=${root_uuid2}, name=\"root-${architecture}-2\", attrs=\"GUID:59\"
@@ -449,6 +449,168 @@ $imgs/zzz8 : start=     6422488, size=      131072, type=4D21B016-B534-45C2-A9FB
 
     cryptsetup luksDump "${loop}p8" | grep 'Flags:[[:space:]]*(no flags)' >/dev/null
     losetup -d "$loop"
+}
+
+testcase_copy_from_grain_padding() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    truncate -s 80MiB "$imgs/copy_from"
+    sfdisk "$imgs/copy_from" <<EOF
+label: gpt
+grain: 4194304
+
+size=40961, type=${root_guid}, uuid=837c3d67-21b3-478e-be82-7e7f83bf96d3
+size=10240, type=${xbootldr_guid}, uuid=4985c03e-eecb-4fe0-9f65-3f6345782214
+EOF
+
+    output=$(sfdisk --dump "$imgs/copy_from")
+
+    # Padding between partition 1 and 2 is 8191 sectors
+    assert_in "$imgs/copy_from1 : start=        8192, size=       40961, type=${root_guid}," "$output"
+    assert_in "$imgs/copy_from2 : start=       57344, size=       10240, type=${xbootldr_guid}," "$output"
+
+    truncate -s 100MiB "$imgs/copy_to"
+    output=$(systemd-repart --offline="$OFFLINE" \
+                            --empty=allow \
+                            --definitions="$defs" \
+                            --seed="$seed" \
+                            --dry-run=no \
+                            --json=pretty \
+                            --copy-from="$imgs/copy_from" \
+                            --grain-size=512 \
+                            "$imgs/copy_to")
+
+    output=$(sfdisk --dump "$imgs/copy_to")
+
+    assert_in "$imgs/copy_to1 : start=        2048, size=       40961, type=${root_guid}," "$output"
+    # We set new grain-size to 1 sector, so padding now should be 8191 sectors again
+    assert_in "$imgs/copy_to2 : start=       51200, size=       10240, type=${xbootldr_guid}," "$output"
+}
+
+testcase_copy_from_respects_new_grain() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    truncate -s 80MiB "$imgs/copy_from"
+    sfdisk "$imgs/copy_from" <<EOF
+label: gpt
+
+size=20480, type=${root_guid}, uuid=837c3d67-21b3-478e-be82-7e7f83bf96d3
+size=10240, type=${xbootldr_guid}, uuid=4985c03e-eecb-4fe0-9f65-3f6345782214
+EOF
+
+    truncate -s 100MiB "$imgs/copy_to"
+    output=$(systemd-repart --offline="$OFFLINE" \
+                            --empty=allow \
+                            --definitions="$defs" \
+                            --seed="$seed" \
+                            --dry-run=no \
+                            --json=pretty \
+                            --copy-from="$imgs/copy_from" \
+                            --grain-size=4194304 \
+                            "$imgs/copy_to")
+
+    output=$(sfdisk --dump "$imgs/copy_to")
+
+    assert_in "$imgs/copy_to1 : start=        8192, size=       24576, type=${root_guid}," "$output"
+    assert_in "$imgs/copy_to2 : start=       32768, size=       16384, type=${xbootldr_guid}," "$output"
+}
+
+testcase_copy_from_no_padding_at_beginning_and_end() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    tee "$defs/03-esp.conf" <<EOF
+[Partition]
+Type=esp
+EOF
+
+    truncate -s 80MiB "$imgs/copy_from"
+    sfdisk "$imgs/copy_from" <<EOF
+label: gpt
+
+start=2280, size=20480, type=${root_guid}, uuid=837c3d67-21b3-478e-be82-7e7f83bf96d3
+start=22760, size=10240, type=${xbootldr_guid}, uuid=4985c03e-eecb-4fe0-9f65-3f6345782214
+EOF
+
+    truncate -s 60MiB "$imgs/copy_to"
+    output=$(systemd-repart --offline="$OFFLINE" \
+                            --empty=allow \
+                            --definitions="$defs" \
+                            --seed="$seed" \
+                            --dry-run=no \
+                            --json=pretty \
+                            --copy-from="$imgs/copy_from" \
+                            "$imgs/copy_to")
+
+    output=$(sfdisk --dump "$imgs/copy_to")
+
+    assert_in "first-lba: 2048" "$output"
+    assert_in "last-lba: 122846" "$output"
+    assert_in "$imgs/copy_to1 : start=        2048, size=       20480, type=${root_guid}," "$output"
+    assert_in "$imgs/copy_to2 : start=       22528, size=       10240, type=${xbootldr_guid}," "$output"
+    assert_in "$imgs/copy_to3 : start=       32768, size=       90072, type=${esp_guid}," "$output"
+}
+
+testcase_size_auto_with_grain_size() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    tee "$defs/01-esp.conf" <<EOF
+[Partition]
+Type=esp
+SizeMinBytes=10M
+EOF
+
+    tee "$defs/02-usr.conf" <<EOF
+[Partition]
+Type=usr-${architecture}
+SizeMinBytes=10M
+EOF
+
+    tee "$defs/03-root.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+SizeMinBytes=10M
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --empty=create \
+                   --size=auto \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --grain-size=2097152 \
+                   "$imgs/auto"
+
+    output=$(sfdisk --dump "$imgs/auto")
+
+    assert_in "first-lba: 2048" "$output"
+    assert_in "last-lba: 65535" "$output"
+    assert_in "$imgs/auto1 : start=        4096, size=       20480, type=${esp_guid}," "$output"
+    assert_in "$imgs/auto2 : start=       24576, size=       20480, type=${usr_guid}," "$output"
+    assert_in "$imgs/auto3 : start=       45056, size=       20480, type=${root_guid}," "$output"
 }
 
 testcase_dropin() {
@@ -500,8 +662,8 @@ EOF
 		"raw_size" : 33554432,
 		"size" : "-> 32M",
 		"old_padding" : 0,
-		"raw_padding" : 0,
-		"padding" : "-> 0B",
+		"raw_padding" : 70234112,
+		"padding" : "-> 66.9M",
 		"activity" : "create",
 		"drop-in_files" : [
 			"$defs/root.conf.d/override1.conf",
@@ -577,8 +739,8 @@ EOF
 		"raw_size" : 33554432,
 		"size" : "-> 32M",
 		"old_padding" : 0,
-		"raw_padding" : 0,
-		"padding" : "-> 0B",
+		"raw_padding" : 36679680,
+		"padding" : "-> 34.9M",
 		"activity" : "create"
 	}
 ]
@@ -704,6 +866,149 @@ EOF
     assert_in "$imgs/unaligned1 : start=        2048, size=       69044," "$output"
     assert_in "$imgs/unaligned2 : start=       71092, size=     3591848," "$output"
     assert_in "$imgs/unaligned3 : start=     3662944, size=    17308536, type=${root_guid}, uuid=${root_uuid}, name=\"root-${architecture}\", attrs=\"GUID:59\"" "$output"
+}
+
+testcase_output_order() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** Ensure the order of the partition list is correct ***"
+
+    # make this one min size 20MiB so that it has to be assigned slot 4
+    tee "$defs/01-home.conf" <<EOF
+[Partition]
+Type=home
+SizeMinBytes=20971520
+EOF
+
+    tee "$defs/02-swap.conf" <<EOF
+[Partition]
+Type=swap
+EOF
+
+    tee "$defs/03-esp.conf" <<EOF
+[Partition]
+Type=esp
+EOF
+
+    tee "$defs/04-root.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+EOF
+
+    truncate -s 80MiB "$imgs/order"
+    sfdisk "$imgs/order" <<EOF
+label: gpt
+
+size=10M, type=${root_guid}, uuid=837c3d67-21b3-478e-be82-7e7f83bf96d3
+size=5M, type=${xbootldr_guid}, uuid=4985c03e-eecb-4fe0-9f65-3f6345782214
+start=30M, size=10M, type=${esp_guid}, uuid=91c30bc9-0187-4db6-81a2-c648294197f8
+EOF
+
+    output=$(systemd-repart --offline="$OFFLINE" \
+                            --definitions="$defs" \
+                            --seed="$seed" \
+                            --dry-run=no \
+                            --json=pretty \
+                            "$imgs/order")
+
+    diff -u - <<EOF <(echo "$output")
+[
+	{
+		"type" : "root-$architecture",
+		"label" : "root-$architecture",
+		"uuid" : "837c3d67-21b3-478e-be82-7e7f83bf96d3",
+		"partno" : 0,
+		"file" : "$defs/04-root.conf",
+		"node" : "$imgs/order1",
+		"offset" : 1048576,
+		"old_size" : 10485760,
+		"raw_size" : 10485760,
+		"size" : "10M",
+		"old_padding" : 0,
+		"raw_padding" : 0,
+		"padding" : "0B",
+		"activity" : "unchanged"
+	},
+	{
+		"type" : "xbootldr",
+		"label" : "xbootldr",
+		"uuid" : "4985c03e-eecb-4fe0-9f65-3f6345782214",
+		"partno" : 1,
+		"file" : null,
+		"node" : "$imgs/order2",
+		"offset" : 11534336,
+		"old_size" : 5242880,
+		"raw_size" : 5242880,
+		"size" : "5M",
+		"old_padding" : 14680064,
+		"raw_padding" : 0,
+		"padding" : "14M -> 0B",
+		"activity" : "unchanged"
+	},
+	{
+		"type" : "swap",
+		"label" : "swap",
+		"uuid" : "78c92db8-3d2b-4823-b0dc-792b78f66f1e",
+		"partno" : 3,
+		"file" : "$defs/02-swap.conf",
+		"node" : "$imgs/order4",
+		"offset" : 16777216,
+		"old_size" : 0,
+		"raw_size" : 14680064,
+		"size" : "-> 14M",
+		"old_padding" : 0,
+		"raw_padding" : 0,
+		"padding" : "-> 0B",
+		"activity" : "create"
+	},
+	{
+		"type" : "esp",
+		"label" : "esp",
+		"uuid" : "91c30bc9-0187-4db6-81a2-c648294197f8",
+		"partno" : 2,
+		"file" : "$defs/03-esp.conf",
+		"node" : "$imgs/order3",
+		"offset" : 31457280,
+		"old_size" : 10485760,
+		"raw_size" : 26202112,
+		"size" : "10M -> 24.9M",
+		"old_padding" : 41922560,
+		"raw_padding" : 0,
+		"padding" : "39.9M -> 0B",
+		"activity" : "resize"
+	},
+	{
+		"type" : "home",
+		"label" : "home",
+		"uuid" : "4980595d-d74a-483a-aa9e-9903879a0ee5",
+		"partno" : 4,
+		"file" : "$defs/01-home.conf",
+		"node" : "$imgs/order5",
+		"offset" : 57659392,
+		"old_size" : 0,
+		"raw_size" : 26206208,
+		"size" : "-> 24.9M",
+		"old_padding" : 0,
+		"raw_padding" : 0,
+		"padding" : "-> 0B",
+		"activity" : "create"
+	}
+]
+EOF
+
+    output=$(sfdisk --dump "$imgs/order")
+
+    assert_in "$imgs/order1 : start=        2048, size=       20480, type=${root_guid}," "$output"
+    assert_in "$imgs/order2 : start=       22528, size=       10240, type=${xbootldr_guid}," "$output"
+    assert_in "$imgs/order3 : start=       61440, size=       51176, type=${esp_guid}," "$output"
+    assert_in "$imgs/order4 : start=       32768, size=       28672, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F," "$output"
+    assert_in "$imgs/order5 : start=      112616, size=       51184, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915," "$output"
 }
 
 testcase_issue_21817() {
@@ -1618,6 +1923,8 @@ Type=root
 MakeDirectories=/dir
 MakeSymlinks=/foo:/bar
 MakeSymlinks=/dir/foo:/bar
+MakeSymlinks=/dir/foo-%a:/bar-%a
+MakeSymlinks=/dir/bar-%a:../bar-%a
 EOF
 
     systemd-repart --offline="$OFFLINE" \
@@ -1632,6 +1939,8 @@ EOF
     systemd-dissect "$imgs/zzz" -M "$imgs/mnt"
     assert_eq "$(readlink "$imgs/mnt/foo")" "/bar"
     assert_eq "$(readlink "$imgs/mnt/dir/foo")" "/bar"
+    assert_eq "$(readlink "$imgs/mnt/dir/foo-${architecture}")" "/bar-${architecture}"
+    assert_eq "$(readlink "$imgs/mnt/dir/bar-${architecture}")" "../bar-${architecture}"
     systemd-dissect -U "$imgs/mnt"
 }
 
@@ -1843,6 +2152,174 @@ testcase_varlink_list_devices() {
     varlinkctl call /run/systemd/io.systemd.Repart --graceful=io.systemd.Repart.NoCandidateDevices --collect io.systemd.Repart.ListCandidateDevices '{"ignoreEmpty":true,"ignoreRoot":true}'
 }
 
+testcase_varlink_subscribe_devices() {
+    local imgs subscribe_log pre_existing_log loop loop2 mark non_sub_output
+    local sub_unit="test-repart-subscribe.service"
+    local pre_unit="test-repart-subscribe-pre.service"
+
+    # The uevent monitor in the spawned systemd-repart only sees events from the host's kernel
+    # uevent namespace, which an nspawn container with --private-network filters away. Loopback
+    # creation also fails inside many container setups.
+    if systemd-detect-virt --container >/dev/null 2>&1; then
+        echo "Skipping subscribe tests inside container."
+        return
+    fi
+
+    REPART="$(which systemd-repart)"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.subscribe.XXXXXXXXXX")"
+    subscribe_log="$(mktemp "/var/tmp/test-repart.subscribe-log.XXXXXXXXXX")"
+    pre_existing_log="$(mktemp "/var/tmp/test-repart.pre-log.XXXXXXXXXX")"
+    loop=""
+    loop2=""
+
+    # Single-quoted trap body so $loop / $loop2 are expanded at trap-fire time, not now.
+    # shellcheck disable=SC2016
+    trap '
+        systemctl stop "$sub_unit" "$pre_unit" 2>/dev/null || true
+        [[ -n "${loop:-}"  ]] && systemd-dissect --detach "$loop"  2>/dev/null || true
+        [[ -n "${loop2:-}" ]] && systemd-dissect --detach "$loop2" 2>/dev/null || true
+        rm -rf "$imgs" "$subscribe_log" "$subscribe_log.err" "$pre_existing_log" "$pre_existing_log.err"
+    ' RETURN
+
+    # systemd-dissect --attach requires a dissectable image; a plain ext4 single-filesystem image
+    # is the simplest thing it accepts.
+    truncate -s 50M "$imgs/loop.img"
+    truncate -s 50M "$imgs/loop2.img"
+    mkfs.ext4 -F -q -L test-repart-1 "$imgs/loop.img"
+    mkfs.ext4 -F -q -L test-repart-2 "$imgs/loop2.img"
+
+    # Make sure no stale unit is sitting around from a previous failed run, then arrange cleanup.
+    systemctl reset-failed "$sub_unit" "$pre_unit" 2>/dev/null || true
+    systemctl stop "$sub_unit" "$pre_unit" 2>/dev/null || true
+
+    # Start a varlinkctl subscriber as a transient Type=notify service. systemd-run blocks until the
+    # service notifies READY=1 -- which varlinkctl does on receipt of the first reply (see
+    # src/varlinkctl/varlinkctl.c reply_callback). For us that's either the first "add" of the
+    # initial enumeration or the "ready" sentinel; either way we are guaranteed the server-side
+    # monitor is up before we trigger any uevents.
+    start_subscriber() {
+        local unit="$1" log="$2" params="$3"
+
+        systemd-run \
+            --quiet \
+            --unit="$unit" \
+            --collect \
+            --service-type=notify \
+            --property=StandardOutput="truncate:$log" \
+            --property=StandardError="truncate:$log.err" \
+            -- \
+            varlinkctl --more --timeout=infinity --json=short call \
+            "$REPART" io.systemd.Repart.ListCandidateDevices "$params"
+    }
+
+    # Poll for a regex match in $1 of the named log file ($3, default $subscribe_log), starting from
+    # byte offset $2. Prints the new byte offset (post-match) on stdout so the caller can advance.
+    expect_event() {
+        local pat="$1" mark_="$2" file="${3:-$subscribe_log}"
+        local deadline_=$((SECONDS + UDEVADM_WAIT_TIMEOUT))
+        local cur
+
+        while (( SECONDS < deadline_ )); do
+            cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
+            if (( cur > mark_ )) && \
+               tail -c +"$((mark_ + 1))" "$file" | grep -a -E "$pat" >/dev/null; then
+                printf '%s\n' "$cur"
+                return 0
+            fi
+            sleep 0.1
+        done
+
+        echo "FAIL: pattern '$pat' did not appear within ${UDEVADM_WAIT_TIMEOUT}s. Output past offset $mark_:" >&2
+        tail -c +"$((mark_ + 1))" "$file" >&2 || true
+        return 1
+    }
+
+    # === Test 1: subscribing produces a "ready" sentinel even on an empty initial set ===
+    start_subscriber "$sub_unit" "$subscribe_log" \
+        '{"ignoreRoot":true,"ignoreEmpty":true,"subscribe":true}'
+    mark=$(expect_event '"action":"ready"' 0) || return 1
+
+    # === Test 2: a freshly-added loopback produces an "add" event ===
+    loop="$(systemd-dissect --attach --loop-ref=test-repart-1 "$imgs/loop.img")"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "$loop"
+    mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop\"" "$mark") || return 1
+
+    # === Test 3: detaching the loopback produces a "remove" event ===
+    systemd-dissect --detach "$loop"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop"
+    mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop\"" "$mark") || return 1
+    loop=""
+
+    # === Test 4: five add/remove cycles in a row stay in sync ===
+    for _ in 1 2 3 4 5; do
+        loop="$(systemd-dissect --attach --loop-ref=test-repart-1 "$imgs/loop.img")"
+        udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "$loop"
+        mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop\"" "$mark") || return 1
+
+        systemd-dissect --detach "$loop"
+        udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop"
+        mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop\"" "$mark") || return 1
+        loop=""
+    done
+
+    # === Test 5: two coexisting loop devices each produce their own events ===
+    # Set them up (and tear them down) one at a time and wait for each device in turn, so events
+    # appear in a strict order and we can advance our mark monotonically.
+    loop="$(systemd-dissect --attach --loop-ref=test-repart-1 "$imgs/loop.img")"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "$loop"
+    mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop\"" "$mark") || return 1
+
+    loop2="$(systemd-dissect --attach --loop-ref=test-repart-2 "$imgs/loop2.img")"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "$loop2"
+    mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop2\"" "$mark") || return 1
+
+    systemd-dissect --detach "$loop2"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop2"
+    mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop2\"" "$mark") || return 1
+    loop2=""
+
+    systemd-dissect --detach "$loop"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop"
+    mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop\"" "$mark") || return 1
+    loop=""
+
+    # Tear down the first subscriber before starting the next one.
+    systemctl stop "$sub_unit"
+
+    # === Test 6: a device that exists *before* subscribe starts shows up in the initial enumeration,
+    # and "ready" arrives only after it ===
+    loop="$(systemd-dissect --attach --loop-ref=test-repart-1 "$imgs/loop.img")"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "$loop"
+
+    start_subscriber "$pre_unit" "$pre_existing_log" \
+        '{"ignoreRoot":true,"subscribe":true}'
+
+    # systemd-run returned (Type=notify => first reply already received), but "ready" may not be
+    # written yet -- poll for it.
+    expect_event '"action":"ready"' 0 "$pre_existing_log" >/dev/null || return 1
+
+    # Everything up to (but excluding) "ready" is the initial enumeration; it must contain $loop.
+    if ! sed -n '/"action":"ready"/q;p' "$pre_existing_log" | \
+            grep -a -E "\"action\":\"add\".*\"node\":\"$loop\"" >/dev/null; then
+        echo "FAIL: pre-existing loop device $loop not in initial enumeration:" >&2
+        cat "$pre_existing_log" >&2
+        return 1
+    fi
+
+    systemctl stop "$pre_unit"
+
+    # === Test 7: without subscribe the reply has no "action" field (back-compat for older clients) ===
+    non_sub_output="$(varlinkctl --collect --json=short call \
+        "$REPART" --graceful=io.systemd.Repart.NoCandidateDevices \
+        io.systemd.Repart.ListCandidateDevices '{"ignoreRoot":true}')"
+    assert_not_in '"action"' "$non_sub_output"
+    # Sanity-check: our $loop *is* in that output (so the assertion above wasn't vacuous).
+    assert_in "\"node\":\"$loop\"" "$non_sub_output"
+
+    systemd-dissect --detach "$loop"
+    loop=""
+}
+
 testcase_get_size() {
     local defs
 
@@ -1951,7 +2428,7 @@ EOF
     touch "$imgs/empty-password"
 
     # the expectation for hmac-sha256 is 'integrity: hmac(sha256)'
-    cryptsetup luksDump "${loop}p1" | grep -q "integrity: $(echo "$1" | sed -r 's/^hmac-(.*)$/hmac(\1)/')"
+    cryptsetup luksDump "${loop}p1" | grep "integrity: $(echo "$1" | sed -r 's/^hmac-(.*)$/hmac(\1)/')" >/dev/null
 
     cryptsetup open --type=luks2 --key-file="$imgs/empty-password" "${loop}p1" "$volume"
     dmsetup status > "$dmstatus"
@@ -2132,6 +2609,40 @@ EOF
     losetup -d "$loop"
 }
 
+testcase_encrypted_volume_empty_name() {
+    local defs imgs
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** testcase for EncryptedVolume= with empty volume name ***"
+
+    tee "$defs/root.conf" <<EOF
+[Partition]
+Type=linux-generic
+Format=ext4
+Encrypt=key-file
+EncryptedVolume=:none:discard
+EOF
+
+    systemd-repart --pretty=yes \
+                   --definitions "$defs" \
+                   --empty=create \
+                   --size=100M \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --offline="$OFFLINE" \
+                   --generate-crypttab="$imgs/crypttab" \
+                   "$imgs/emptyvolname.img"
+
+    # systemd-repart should fill in volume name as luks-UUID
+    grep -Eq '^luks-[0-9a-f-]{36} UUID=[0-9a-f-]{36} none discard$' \
+        "$imgs/crypttab"
+}
+
 testcase_block_device_replace() {
     if [[ "$OFFLINE" == "yes" ]]; then
         return 0
@@ -2149,7 +2660,7 @@ testcase_block_device_replace() {
 
     local defs imgs btrfs_mntpoint_plain btrfs_mntpoint_encrypted
     local loop loop_btrfs_plain loop_btrfs_encrypted
-    local encrypted_device
+    local dm_btrfs_encrypted encrypted_device
 
     btrfs_mntpoint_plain="$(mktemp --directory "/tmp/test-repart.btrfs-mntpoint-plain.XXXXXXXXXX")"
     btrfs_mntpoint_encrypted="$(mktemp --directory "/tmp/test-repart.btrfs-mntpoint-encrypted.XXXXXXXXXX")"
@@ -2216,11 +2727,145 @@ EOF
                    "${loop}"
 
     assert_eq "$(findmnt "${btrfs_mntpoint_plain}" -o SOURCE -n)" "${loop}p1"
-    assert_eq "$(findmnt "${btrfs_mntpoint_encrypted}" -o SOURCE -n)" "/dev/mapper/btrfs-replace-encrypted"
+    dm_btrfs_encrypted="$(findmnt "${btrfs_mntpoint_encrypted}" -o SOURCE -n)"
+    if [[ "$dm_btrfs_encrypted" != "/dev/mapper/btrfs-replace-encrypted" ]]; then
+        # When libdevmapper is built without UDEV_SYNC_SUPPORT (e.g. on Alpine/postmarketOS),
+        # it creates a device node under /dev/mapper/ instead of relying on udev to create a symlink.
+        # In this case, verify that both device nodes refer to the same underlying device.
+        assert_eq "$(stat -c %Hr:%Lr "$dm_btrfs_encrypted")" "$(stat -c %Hr:%Lr /dev/mapper/btrfs-replace-encrypted)"
+    fi
     encrypted_device="/sys/dev/block/$(dmsetup table /dev/mapper/btrfs-replace-encrypted | cut -d" " -f7)"
     assert_eq "$(udevadm info --query=property --property=DEVNAME --value "${encrypted_device}")" "${loop}p2"
     grep -q tada "${btrfs_mntpoint_plain}/magic-plain"
     grep -q tada "${btrfs_mntpoint_encrypted}/magic-encrypted"
+}
+
+testcase_insert_into_gap() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** Inserting a new partition into a gap between two existing partitions ***"
+
+    truncate -s 71M "$imgs/gap.img"
+    sfdisk "$imgs/gap.img" <<EOF
+label: gpt
+size=10M, type=${esp_guid}, name="part-a",
+start=60M, size=10M, type=${root_guid}, name="part-c",
+EOF
+
+    tee "$defs/new.conf" <<EOF
+[Partition]
+Type=usr
+Label=part-b
+SizeMinBytes=10M
+SizeMaxBytes=10M
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   "$imgs/gap.img"
+
+    output=$(sfdisk --dump "$imgs/gap.img")
+
+    assert_in "$imgs/gap.img1 : start=        2048, size=       20480," "$output"
+    assert_in "$imgs/gap.img2 : start=      122880, size=       20480," "$output"
+
+    # New partition B must start at the beginning of the gap (after A), not at
+    # the end (before C).
+    assert_in "$imgs/gap.img3 : start=       22528, size=       20480, type=$usr_guid, uuid=$usr_uuid, name=\"part-b\"" "$output"
+}
+
+testcase_distribute_leftover_space() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** Left over space after distributing according to weights should still be assigned ***"
+
+    tee "$defs/01-esp.conf" <<EOF
+[Partition]
+Type=esp
+Weight=1
+SizeMinBytes=5M
+EOF
+
+    tee "$defs/02-usr.conf" <<EOF
+[Partition]
+Type=usr-${architecture}
+Weight=1000
+SizeMinBytes=1M
+SizeMaxBytes=2M
+EOF
+
+    truncate -s 20M "$imgs/leftover.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=allow \
+                   "$imgs/leftover.img"
+
+    output=$(sfdisk --dump "$imgs/leftover.img")
+
+    # esp should get all the leftover space
+    assert_in "$imgs/leftover.img1 : start=        2048, size=       34776, type=$esp_guid," "$output"
+    assert_in "$imgs/leftover.img2 : start=       36824, size=        4096, type=$usr_guid," "$output"
+
+    rm "$defs/01-esp.conf"
+    rm "$defs/02-usr.conf"
+    rm "$imgs/leftover.img"
+
+    tee "$defs/01-xbootldr.conf" <<EOF
+[Partition]
+Type=xbootldr
+SizeMaxBytes=10M
+EOF
+
+    tee "$defs/02-usr.conf" <<EOF
+[Partition]
+Type=usr-${architecture}
+Weight=1000
+SizeMinBytes=1M
+SizeMaxBytes=2M
+EOF
+
+    tee "$defs/03-esp.conf" <<EOF
+[Partition]
+Type=esp
+Weight=1
+SizeMinBytes=5M
+EOF
+
+    truncate -s 25M "$imgs/leftover2.img"
+    sfdisk "$imgs/leftover2.img" <<EOF
+label: gpt
+size=3M, type=${xbootldr_guid},
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=allow \
+                   "$imgs/leftover2.img"
+
+    output=$(sfdisk --dump "$imgs/leftover2.img")
+
+    # xbootldr should get the leftover space and grow to 10M, then esp should get the rest
+    assert_in "$imgs/leftover2.img1 : start=        2048, size=       20480, type=$xbootldr_guid," "$output"
+    assert_in "$imgs/leftover2.img2 : start=       22528, size=        4096, type=$usr_guid," "$output"
+    assert_in "$imgs/leftover2.img3 : start=       26624, size=       24536, type=$esp_guid," "$output"
 }
 
 OFFLINE="yes"

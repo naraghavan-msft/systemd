@@ -207,6 +207,7 @@ int bus_session_method_terminate(sd_bus_message *message, void *userdata, sd_bus
                         s->user->user_record->uid,
                         /* flags= */ 0,
                         &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -252,6 +253,7 @@ int bus_session_method_lock(sd_bus_message *message, void *userdata, sd_bus_erro
                         s->user->user_record->uid,
                         /* flags= */ 0,
                         &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -362,6 +364,7 @@ int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
                         s->user->user_record->uid,
                         /* flags= */ 0,
                         &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -580,8 +583,7 @@ static int method_take_device(sd_bus_message *message, void *userdata, sd_bus_er
                 return sd_bus_error_set(error, BUS_ERROR_NOT_IN_CONTROL, "You are not in control of this session");
 
         dev = makedev(major, minor);
-        sd = hashmap_get(s->devices, &dev);
-        if (sd)
+        if (hashmap_contains(s->devices, &dev))
                 /* We don't allow retrieving a device multiple times.
                  * The related ReleaseDevice call is not ref-counted.
                  * The caller should use dup() if it requires more

@@ -163,6 +163,8 @@ char* ascii_strupper(char *s) {
 }
 
 char* ascii_strlower_n(char *s, size_t n) {
+        assert(n <= 0 || s);
+
         if (n <= 0)
                 return s;
 
@@ -285,6 +287,12 @@ static size_t previous_ansi_sequence(const char *s, size_t length, const char **
 
         /* Locate the previous ANSI sequence and save its start in *ret_where and return length. */
 
+        if (length < 2) {
+                /* Need at least two bytes for an ANSI sequence */
+                *ret_where = NULL;
+                return 0;
+        }
+
         for (size_t i = length - 2; i > 0; i--) {  /* -2 because at least two bytes are needed */
                 size_t slen = ansi_sequence_length(s + (i - 1), length - (i - 1));
                 if (slen == 0)
@@ -349,6 +357,33 @@ static char *ascii_ellipsize_mem(const char *s, size_t old_length, size_t new_le
         return t;
 }
 
+/* Walk backwards from 'end' (exclusive) to the start of the last complete UTF-8 character, without
+ * descending below 'start', validate it and return a pointer to its first byte, optionally decoding it
+ * into *ret_c. Returns NULL on a truncated or otherwise malformed sequence. */
+static const char* find_previous_unichar(const char *start, const char *end, char32_t *ret_c) {
+        const char *p;
+        int r;
+
+        assert(start);
+        assert(end);
+        assert(end > start);
+
+        for (p = end; p > start; ) {
+                p--;
+                if (((uint8_t) *p & 0xc0) != 0x80) /* Found a non-continuation byte, i.e. a character start. */
+                        break;
+        }
+
+        r = utf8_encoded_valid_unichar(p, end - p);
+        if (r < 0 || p + r != end)
+                return NULL;
+
+        if (ret_c)
+                assert_se(utf8_encoded_to_unichar(p, ret_c) == r);
+
+        return p;
+}
+
 char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigned percent) {
         size_t x, k, len, len2;
         const char *i, *j;
@@ -392,10 +427,12 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
                         continue;  /* ANSI sequences don't take up any space in output */
                 }
 
-                char32_t c;
-                r = utf8_encoded_to_unichar(i, &c);
+                r = utf8_encoded_valid_unichar(i, s + old_length - i);
                 if (r < 0)
                         return NULL;
+
+                char32_t c;
+                assert_se(utf8_encoded_to_unichar(i, &c) == r);
 
                 int w = unichar_iswide(c) ? 2 : 1;
                 if (k + w > x)
@@ -423,9 +460,9 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
                         continue;
                 }
 
-                tt = utf8_prev_char(t);
-                r = utf8_encoded_to_unichar(tt, &c);
-                if (r < 0)
+                /* Find the previous complete UTF-8 character inside the retained suffix. */
+                tt = find_previous_unichar(i, t, &c);
+                if (!tt)
                         return NULL;
 
                 w = unichar_iswide(c) ? 2 : 1;
@@ -443,11 +480,21 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
         if (k >= new_length) {
                 /* Make space for ellipsis, if required and possible. We know that the edge character is not
                  * part of an ANSI sequence (because then we'd skip it). If the last character we looked at
-                 * was wide, we don't need to make space. */
-                if (j < s + old_length)
-                        j = utf8_next_char(j);
-                else if (i > s)
-                        i = utf8_prev_char(i);
+                 * was wide, we don't need to make space.
+                 * Move the edge by one complete UTF-8 character within the input slice. */
+                if (j < s + old_length) {
+                        r = utf8_encoded_valid_unichar(j, s + old_length - j);
+                        if (r < 0)
+                                return NULL;
+
+                        j += r;
+                } else if (i > s) {
+                        const char *tt = find_previous_unichar(s, i, NULL);
+                        if (!tt)
+                                return NULL;
+
+                        i = tt;
+                }
         }
 
         len = i - s;
@@ -1003,23 +1050,29 @@ char* strrep(const char *s, size_t n) {
 int split_pair(const char *s, const char *sep, char **ret_first, char **ret_second) {
         assert(s);
         assert(!isempty(sep));
-        assert(ret_first);
-        assert(ret_second);
 
         const char *x = strstr(s, sep);
         if (!x)
                 return -EINVAL;
 
-        _cleanup_free_ char *a = strndup(s, x - s);
-        if (!a)
-                return -ENOMEM;
+        _cleanup_free_ char *a = NULL;
+        if (ret_first) {
+                a = strndup(s, x - s);
+                if (!a)
+                        return -ENOMEM;
+        }
 
-        _cleanup_free_ char *b = strdup(x + strlen(sep));
-        if (!b)
-                return -ENOMEM;
+        _cleanup_free_ char *b = NULL;
+        if (ret_second) {
+                b = strdup(x + strlen(sep));
+                if (!b)
+                        return -ENOMEM;
+        }
 
-        *ret_first = TAKE_PTR(a);
-        *ret_second = TAKE_PTR(b);
+        if (ret_first)
+                *ret_first = TAKE_PTR(a);
+        if (ret_second)
+                *ret_second = TAKE_PTR(b);
         return 0;
 }
 
@@ -1129,11 +1182,17 @@ bool string_is_safe(const char *p, StringSafeFlags flags) {
                 if (!FLAGS_SET(flags, STRING_ALLOW_GLOBS) && strchr(GLOB_CHARS, *t))
                         return false;
 
+                if (FLAGS_SET(flags, STRING_DISALLOW_WHITESPACE) && strchr(WHITESPACE, *t))
+                        return false;
+
                 if (FLAGS_SET(flags, STRING_ASCII) && (uint8_t) *t >= 0x80)
                         return false;
         }
 
         if (FLAGS_SET(flags, STRING_FILENAME) && !filename_is_valid(p))
+                return false;
+
+        if (FLAGS_SET(flags, STRING_FILENAME_PART) && !filename_part_is_valid(p))
                 return false;
 
         return true;
@@ -1442,28 +1501,47 @@ char* find_line_after_internal(const char *haystack, const char *needle) {
         return NULL;
 }
 
-bool version_is_valid(const char *s) {
-        if (isempty(s))
+bool version_is_valid(const char *s, VersionFlags flags) {
+
+        /* Validates a version string superficially. This does not proces the version string in any
+         * semantical way, it mostly just validates that its charset is reasonable. */
+
+        if (FLAGS_SET(flags, VERSION_ALLOW_EMPTY) ? !s : isempty(s))
                 return false;
 
         if (!filename_part_is_valid(s))
                 return false;
 
-        /* This is a superset of the characters used by semver. We additionally allow "," and "_". */
-        if (!in_charset(s, ALPHANUMERICAL ".,_-+"))
-                return false;
+        /* We always allow all characters specified by the UAPI.10 Version Specification, i.e. 0-9, a-z, A-Z,
+         * ".", "-", "~", "^".
+         *
+         * If the relevant flags are set we'll also allow "+" and "_" separators.
+         *
+         * Note that with SemVer allows 0-9, a-z, A-Z, "+", "-", ".", hence with VERSION_ALLOW_PLUS we
+         * implement a superset of it.
+         *
+         * If you wonder when to use which flags: when validating foreign versions (e.g. distribution
+         * versions in /etc/os-release or so) validate liberally, i.e. add
+         * VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS. When validating our own versioned objects (e.g. vpick
+         * or so) validate more strictly, and in particular refuse characters such as "_" and "+" that may be
+         * used for separating component names or boot attempt counters. Also: first – if appropriate – split
+         * the string into individual components. For example, if the string consists of a name and a
+         * version, separated by some character, only pass the version part to this function. The name part
+         * may pass verification, but it's cleaner to not rely on that.
+         *
+         * For details about UAPI.10 see:
+         *
+         * → https://uapi-group.org/specifications/specs/version_format_specification/ */
 
-        return true;
-}
+        char charset[] = ALPHANUMERICAL ".-~^" /* plus room for the two chars below: */ "\0\0";
+        size_t l = strlen(charset);
 
-bool version_is_valid_versionspec(const char *s) {
-        if (!filename_part_is_valid(s))
-                return false;
+        if (FLAGS_SET(flags, VERSION_ALLOW_UNDERSCORE))
+                charset[l++] = '_';
+        if (FLAGS_SET(flags, VERSION_ALLOW_PLUS))
+                charset[l++] = '+';
 
-        if (!in_charset(s, ALPHANUMERICAL "-.~^"))
-                return false;
-
-        return true;
+        return in_charset(s, charset);
 }
 
 ssize_t strlevenshtein(const char *x, const char *y) {

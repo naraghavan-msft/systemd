@@ -32,7 +32,6 @@
 #include "notify-recv.h"
 #include "os-util.h"
 #include "parse-util.h"
-#include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "runtime-scope.h"
@@ -40,8 +39,8 @@
 #include "signal-util.h"
 #include "string-table.h"
 #include "strv.h"
+#include "sysupdate-target.h"
 #include "sysupdate-util.h"
-#include "utf8.h"
 
 #define FEATURES_DROPIN_NAME "systemd-sysupdate-enabled"
 
@@ -63,25 +62,6 @@ typedef struct Manager {
 
 /* Forward declare so that jobs can call it on exit */
 static void manager_check_idle(Manager *m);
-
-typedef enum TargetClass {
-        /* These should try to match ImageClass from src/basic/os-util.h */
-        TARGET_MACHINE  = IMAGE_MACHINE,
-        TARGET_PORTABLE = IMAGE_PORTABLE,
-        TARGET_SYSEXT   = IMAGE_SYSEXT,
-        TARGET_CONFEXT  = IMAGE_CONFEXT,
-        _TARGET_CLASS_IS_IMAGE_CLASS_MAX,
-
-        /* sysupdate-specific classes */
-        TARGET_HOST = _TARGET_CLASS_IS_IMAGE_CLASS_MAX,
-        TARGET_COMPONENT,
-
-        _TARGET_CLASS_MAX,
-        _TARGET_CLASS_INVALID = -EINVAL,
-} TargetClass;
-
-/* Let's ensure when the number of classes is updated things are updated here too */
-assert_cc((int) _IMAGE_CLASS_MAX == (int) _TARGET_CLASS_IS_IMAGE_CLASS_MAX);
 
 typedef struct Target {
         Manager *manager;
@@ -137,17 +117,6 @@ struct Job {
         sd_bus_message *dbus_msg;
         JobReady detach_cb; /* Callback called when job has started.  Detaches the job to run in the background */
 };
-
-static const char* const target_class_table[_TARGET_CLASS_MAX] = {
-        [TARGET_MACHINE]   = "machine",
-        [TARGET_PORTABLE]  = "portable",
-        [TARGET_SYSEXT]    = "sysext",
-        [TARGET_CONFEXT]   = "confext",
-        [TARGET_COMPONENT] = "component",
-        [TARGET_HOST]      = "host",
-};
-
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(target_class, TargetClass);
 
 static const char* const job_type_table[_JOB_TYPE_MAX] = {
         [JOB_LIST]             = "list",
@@ -983,7 +952,7 @@ static int target_method_describe(sd_bus_message *msg, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        if (!version_is_valid(version))
+        if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
         if ((flags & ~SD_SYSUPDATE_FLAGS_ALL) != 0)
@@ -1133,7 +1102,7 @@ static int target_method_acquire(sd_bus_message *msg, void *userdata, sd_bus_err
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
         else {
-                if (!version_is_valid(version))
+                if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
                 action = "org.freedesktop.sysupdate1.update-to-version";
@@ -1221,7 +1190,7 @@ static int target_method_install(sd_bus_message *msg, void *userdata, sd_bus_err
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
         else {
-                if (!version_is_valid(version))
+                if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
                 action = "org.freedesktop.sysupdate1.update-to-version";
@@ -1411,7 +1380,7 @@ static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_b
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
 
-        r = sysupdate_run_simple(&json, t, "features", NULL);
+        r = sysupdate_run_simple(&json, t, "--offline", "features", NULL);
         if (r < 0)
                 return r;
 
@@ -1433,19 +1402,6 @@ static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_b
         return sd_bus_message_send(reply);
 }
 
-static bool feature_name_is_valid(const char *name) {
-        if (isempty(name))
-                return false;
-
-        if (!ascii_is_valid(name))
-                return false;
-
-        if (!filename_is_valid(strjoina(name, ".feature.d")))
-                return false;
-
-        return true;
-}
-
 static int target_method_describe_feature(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Target *t = ASSERT_PTR(userdata);
         _cleanup_(job_freep) Job *j = NULL;
@@ -1459,7 +1415,7 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         if (r < 0)
                 return r;
 
-        if (!feature_name_is_valid(feature))
+        if (!feature_name_valid(feature))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid feature name");
 
         if (flags != 0)
@@ -1499,7 +1455,7 @@ static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata
         r = sd_bus_message_read(msg, "sit", &feature, &enabled, &flags);
         if (r < 0)
                 return r;
-        if (!feature_name_is_valid(feature))
+        if (!feature_name_valid(feature))
                 return sd_bus_reply_method_errorf(msg,
                                                   SD_BUS_ERROR_INVALID_ARGS,
                                                   "The specified feature is invalid");

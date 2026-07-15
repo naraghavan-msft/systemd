@@ -8,7 +8,7 @@
 #include <sys/keyctl.h>
 #include <sys/mount.h>
 #include <sys/personality.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -20,9 +20,11 @@
 #include "sd-path.h"
 #include "sd-varlink.h"
 
+#include "acl-util.h"
 #include "alloc-util.h"
 #include "barrier.h"
 #include "base-filesystem.h"
+#include "blkid-util.h"
 #include "btrfs-util.h"
 #include "build.h"
 #include "bus-error.h"
@@ -36,12 +38,13 @@
 #include "constants.h"
 #include "copy.h"
 #include "cpu-set-util.h"
+#include "crypto-util.h"
+#include "cryptsetup-util.h"
 #include "daemon-util.h"
 #include "dev-setup.h"
 #include "devnum-util.h"
 #include "discover-image.h"
 #include "dissect-image.h"
-#include "dlfcn-util.h"
 #include "env-util.h"
 #include "escape.h"
 #include "ether-addr-util.h"
@@ -76,6 +79,7 @@
 #include "namespace-util.h"
 #include "netlink-internal.h"
 #include "notify-recv.h"
+#include "nspawn.h"
 #include "nspawn-bind-user.h"
 #include "nspawn-cgroup.h"
 #include "nspawn-expose-ports.h"
@@ -87,14 +91,13 @@
 #include "nspawn-settings.h"
 #include "nspawn-setuid.h"
 #include "nspawn-stub-pid1.h"
-#include "nspawn.h"
 #include "nsresource.h"
-#include "os-util.h"
-#include "parse-helpers.h"
-#include "osc-context.h"
 #include "options.h"
+#include "os-util.h"
+#include "osc-context.h"
 #include "pager.h"
 #include "parse-argument.h"
+#include "parse-helpers.h"
 #include "parse-util.h"
 #include "path-lookup.h"
 #include "path-util.h"
@@ -3576,8 +3579,9 @@ static int inner_child(
 
         /* Make sure we keep the caps across the uid/gid dropping, so that we can retain some selected caps
          * if we need to later on. */
-        if (prctl(PR_SET_KEEPCAPS, 1) < 0)
-                return log_error_errno(errno, "Failed to set PR_SET_KEEPCAPS: %m");
+        r = prctl_safe(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set PR_SET_KEEPCAPS: %m");
 
         if (uid_is_valid(arg_uid) || gid_is_valid(arg_gid))
                 r = change_uid_gid_raw(arg_uid, arg_gid, arg_supplementary_gids, arg_n_supplementary_gids, arg_console_mode != CONSOLE_PIPE);
@@ -3590,9 +3594,11 @@ static int inner_child(
         if (r < 0)
                 return log_error_errno(r, "Dropping capabilities failed: %m");
 
-        if (arg_no_new_privileges)
-                if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-                        return log_error_errno(errno, "Failed to disable new privileges: %m");
+        if (arg_no_new_privileges) {
+                r = proc_set_nnp();
+                if (r < 0)
+                        return log_error_errno(r, "Failed to disable new privileges: %m");
+        }
 
         /* LXC sets container=lxc, so follow the scheme here */
         envp[n_env++] = strjoina("container=", arg_container_service_name);
@@ -3958,8 +3964,9 @@ static int outer_child(
         if (r < 0)
                 log_debug_errno(r, "Failed to read os-release from host for container, ignoring: %m");
 
-        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
-                return log_error_errno(errno, "PR_SET_PDEATHSIG failed: %m");
+        r = prctl_safe(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+        if (r < 0)
+                return log_error_errno(r, "PR_SET_PDEATHSIG failed: %m");
 
         r = reset_audit_loginuid();
         if (r < 0)
@@ -6104,12 +6111,8 @@ static int do_cleanup(void) {
         if (r < 0)
                 return r;
 
-        _cleanup_free_ char *subdir = path_join("systemd/nspawn", arg_machine);
-        if (!subdir)
-                return log_oom();
-
         _cleanup_free_ char *runtime_dir = NULL;
-        r = runtime_directory(arg_runtime_scope, subdir, &runtime_dir);
+        r = runtime_directory_resolve(arg_runtime_scope, "systemd/nspawn", arg_machine, &runtime_dir);
         if (r < 0)
                 return r;
 
@@ -6133,8 +6136,7 @@ static int run(int argc, char *argv[]) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *nfnl = NULL;
         _cleanup_(pidref_done) PidRef pid = PIDREF_NULL;
         _cleanup_(sd_varlink_unrefp) sd_varlink *nsresource_link = NULL, *mountfsd_link = NULL;
-        _cleanup_free_ char *runtime_dir = NULL, *subdir = NULL;
-        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir_destroy = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
         _cleanup_(fork_notify_terminate) PidRef journal_remote_pidref = PIDREF_NULL;
 
         log_setup();
@@ -6146,9 +6148,13 @@ static int run(int argc, char *argv[]) {
         if (arg_cleanup)
                 return do_cleanup();
 
-        (void) dlopen_libmount(LOG_DEBUG);
-        (void) dlopen_libseccomp(LOG_DEBUG);
-        (void) dlopen_libselinux(LOG_DEBUG);
+        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, suggested);
+        (void) DLOPEN_LIBACL(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBBLKID(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBCRYPTO(LOG_WARNING, recommended);
+        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBSECCOMP(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBSELINUX(LOG_DEBUG, recommended);
 
         r = cg_has_legacy();
         if (r < 0)
@@ -6629,17 +6635,11 @@ static int run(int argc, char *argv[]) {
         } else
                 assert_not_reached();
 
-        subdir = path_join("systemd/nspawn", arg_machine);
-        if (!subdir) {
-                r = log_oom();
-                goto finish;
-        }
-
         r = runtime_directory_make(
                         arg_runtime_scope,
-                        subdir,
-                        &runtime_dir,
-                        &runtime_dir_destroy);
+                        "systemd/nspawn",
+                        arg_machine,
+                        &runtime_dir);
         if (r < 0) {
                 log_error_errno(r, "Failed to create runtime directory: %m");
                 goto finish;

@@ -5,12 +5,13 @@
 # Daniel Korostil <ted.korostiled@gmail.com>, 2014, 2016, 2018.
 # Yuri Chornoivan <yurchor@ukr.net>, 2019, 2020, 2021, 2022, 2023, 2024, 2026.
 # Dmytro Markevych <hotr1pak@gmail.com>, 2024.
+# Deleted User <noreply+1350@weblate.org>, 2026.
 msgid ""
 msgstr ""
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-05-30 00:13+0200\n"
-"PO-Revision-Date: 2026-05-31 10:01+0000\n"
-"Last-Translator: Yuri Chornoivan <yurchor@ukr.net>\n"
+"POT-Creation-Date: 2026-06-01 11:49+0200\n"
+"PO-Revision-Date: 2026-06-07 14:02+0000\n"
+"Last-Translator: Deleted User <noreply+1350@weblate.org>\n"
 "Language-Team: Ukrainian <https://translate.fedoraproject.org/projects/"
 "systemd/main/uk/>\n"
 "Language: uk\n"
@@ -19,7 +20,7 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=n%10==1 && n%100!=11 ? 0 : n%10>=2 && "
 "n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2;\n"
-"X-Generator: Weblate 2026.5\n"
+"X-Generator: Weblate 2026.6.1\n"
 
 #: src/core/org.freedesktop.systemd1.policy.in:22
 msgid "Send passphrase back to system"
@@ -1281,7 +1282,8 @@ msgstr "Скасування встановлення оновлень сист�
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:69
 msgid "Authentication is required to cancel installing system updates."
-msgstr "Для скасування встановлення оновлень системи слід пройти розпізнавання."
+msgstr ""
+"Для скасування встановлення оновлень системи слід пройти розпізнавання."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:78
 msgid "Install specific system version"
@@ -1304,22 +1306,26 @@ msgid ""
 "Authentication is required to cancel updating the system to a specific "
 "(possibly old) version."
 msgstr ""
+"Для скасування оновлення системи до певної (можливо, застарілої) версії слід "
+"пройти розпізнавання."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:98
 msgid "Clean up old system updates"
-msgstr ""
+msgstr "Вилучення застарілих оновлень системи"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:99
 msgid "Authentication is required to clean up old system updates."
-msgstr ""
+msgstr "Для вилучення застарілих оновлень системи слід пройти розпізнавання."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:108
 msgid "Cancel cleaning up old system updates"
-msgstr ""
+msgstr "Скасування вилучення застарілих оновлень системи"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:109
 msgid "Authentication is required to cancel cleanup of old system updates."
 msgstr ""
+"Для скасування вилучення застарілих оновлень системи слід пройти "
+"розпізнавання."
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:118
 msgid "Manage optional features"
@@ -1425,17 +1431,26 @@ msgstr ""
 "Для замороження або розмороження процесів модуля «$(unit)» слід пройти "
 "розпізнавання."
 
-#: src/shared/libfido2-util.c:497 src/shared/libfido2-util.c:554
+#: src/shared/libfido2-util.c:500 src/shared/libfido2-util.c:557
 msgid "Please confirm presence on security token to unlock."
-msgstr ""
+msgstr "Будь ласка, підтвердьте наявність на жетоні захисту для розблокування."
 
-#: src/shared/libfido2-util.c:513
+#: src/shared/libfido2-util.c:516
 msgid "Please verify user on security token to unlock."
 msgstr ""
+"Будь ласка, підтвердьте ідентичність користувача на жетоні захисту для "
+"розблокування."
 
-#: src/shared/libfido2-util.c:926
+#: src/shared/libfido2-util.c:936
+#, fuzzy, c-format
+#| msgid "Please enter security token PIN:"
+msgid ""
+"Please enter security token PIN (remaining attempts before lock-out: %d):"
+msgstr "Будь ласка, введіть PIN жетона захисту:"
+
+#: src/shared/libfido2-util.c:948
 msgid "Please enter security token PIN:"
-msgstr ""
+msgstr "Будь ласка, введіть PIN жетона захисту:"
 
 #~ msgid "Cleanup old system updates"
 #~ msgstr "Вилучення застарілих оновлень системи"

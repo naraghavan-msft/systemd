@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "dlopen-note.h"
 #include "errno-util.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_SECCOMP
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBSECCOMP
+#  error "missing libseccomp_cflags in meson dependency."
+#endif
+
 #include <seccomp.h> /* IWYU pragma: export */
 
 #include "dlfcn-util.h"
@@ -164,7 +169,13 @@ static inline bool is_seccomp_available(void) {
 
 #endif
 
-int dlopen_libseccomp(int log_level);
+int dlopen_libseccomp(int log_level) _dlopen_loader_;
+
+#define DLOPEN_LIBSECCOMP(log_level, priority)                          \
+        ({                                                              \
+                LIBSECCOMP_NOTE(priority);                              \
+                dlopen_libseccomp(log_level);                           \
+        })
 
 /* This is a special value to be used where syscall filters otherwise expect errno numbers, will be
    replaced with real seccomp action. */

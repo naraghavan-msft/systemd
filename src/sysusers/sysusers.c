@@ -11,6 +11,7 @@
 #include "copy.h"
 #include "creds-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -352,7 +353,7 @@ static int make_backup(const char *target, const char *x) {
                 return r;
 
         if (rename(dst_tmp, backup) < 0)
-                return errno;
+                return -errno;
 
         dst_tmp = mfree(dst_tmp); /* disable the unlink_and_freep() hook now that the file has been renamed */
         return 0;
@@ -2268,6 +2269,14 @@ static int run(int argc, char *argv[]) {
 
         Item *i;
         int r;
+
+        LIBAUDIT_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPT_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBCRYPTO_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
 
         char **args = NULL;
         r = parse_argv(argc, argv, &args);

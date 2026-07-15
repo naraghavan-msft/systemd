@@ -2,14 +2,18 @@
 #pragma once
 
 #if HAVE_P11KIT
+#  ifndef SYSTEMD_CFLAGS_MARKER_LIBP11KIT
+#    error "missing libp11kit_cflags in meson dependency."
+#  endif
 #  include <p11-kit/p11-kit.h>  /* IWYU pragma: export */
 #  include <p11-kit/uri.h>      /* IWYU pragma: export */
 #endif
 
 #include "ask-password-api.h"
 #include "dlfcn-util.h"
+#include "dlopen-note.h"
+#include "forward.h"
 #include "pkcs11-padding.h"
-#include "shared-forward.h"
 
 bool pkcs11_uri_valid(const char *uri);
 
@@ -104,7 +108,7 @@ int pkcs11_crypt_device_callback(
 
 #endif
 
-int dlopen_p11kit(int log_level);
+int dlopen_p11kit(int log_level) _dlopen_loader_;
 
 typedef struct {
         const char *friendly_name;

@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "forward.h"
 #include "machine-util.h"
-#include "shared-forward.h"
 
 typedef struct ExtraDrive {
         char *path;
@@ -45,6 +45,7 @@ typedef enum Firmware {
 typedef enum ConfidentialComputing {
         COCO_NO,
         COCO_AMD_SEV_SNP,
+        COCO_INTEL_TDX,
         _COCO_MAX,
         _COCO_INVALID = -EINVAL,
 } ConfidentialComputing;

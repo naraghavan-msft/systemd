@@ -204,7 +204,7 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = dlopen_cryptsetup(LOG_ERR);
+        r = DLOPEN_CRYPTSETUP(LOG_ERR, required);
         if (r < 0)
                 return r;
 

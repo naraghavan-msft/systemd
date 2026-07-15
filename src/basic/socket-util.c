@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -36,6 +37,8 @@
 #include "string-util.h"
 #include "strv.h"
 #include "sysctl-util.h"
+#include "user-util.h"
+#include "xattr-util.h"
 
 #if ENABLE_IDN
 #  define IDN_FLAGS NI_IDN
@@ -910,7 +913,7 @@ int getpeergroups(int fd, gid_t **ret) {
         assert(fd >= 0);
         assert(ret);
 
-        long ngroups_max = sysconf(_SC_NGROUPS_MAX);
+        int ngroups_max = sysconf_ngroups_max();
         if (ngroups_max > 0)
                 n = MAX(n, sizeof(gid_t) * (socklen_t) ngroups_max);
 
@@ -1285,6 +1288,8 @@ size_t sockaddr_un_len(const struct sockaddr_un *sa) {
 }
 
 size_t sockaddr_len(const union sockaddr_union *sa) {
+        assert(sa);
+
         switch (sa->sa.sa_family) {
         case AF_INET:
                 return sizeof(struct sockaddr_in);
@@ -1730,7 +1735,7 @@ int vsock_parse_cid(const char *s, unsigned *ret) {
                 return -EINVAL;
 
         /* Parsed an AF_VSOCK "CID". This is a 32bit entity, and the usual type is "unsigned". We recognize
-         * the three special CIDs as strings, and otherwise parse the numeric CIDs. */
+         * the four special CIDs as strings, and otherwise parse the numeric CIDs. */
 
         if (streq(s, "hypervisor"))
                 *ret = VMADDR_CID_HYPERVISOR;
@@ -1738,6 +1743,8 @@ int vsock_parse_cid(const char *s, unsigned *ret) {
                 *ret = VMADDR_CID_LOCAL;
         else if (streq(s, "host"))
                 *ret = VMADDR_CID_HOST;
+        else if (STR_IN_SET(s, "any", "-1"))
+                *ret = VMADDR_CID_ANY;
         else
                 return safe_atou(s, ret);
 
@@ -1795,30 +1802,6 @@ int socket_address_parse_vsock(SocketAddress *ret_address, const char *s) {
                 .size = sizeof(struct sockaddr_vm),
         };
 
-        return 0;
-}
-
-int vsock_get_local_cid(unsigned *ret) {
-        _cleanup_close_ int vsock_fd = -EBADF;
-
-        vsock_fd = open("/dev/vsock", O_RDONLY|O_CLOEXEC);
-        if (vsock_fd < 0)
-                return log_debug_errno(errno, "Failed to open %s: %m", "/dev/vsock");
-
-        unsigned tmp;
-        if (ioctl(vsock_fd, IOCTL_VM_SOCKETS_GET_LOCAL_CID, &tmp) < 0)
-                return log_debug_errno(errno, "Failed to query local AF_VSOCK CID: %m");
-        log_debug("Local AF_VSOCK CID: %u", tmp);
-
-        /* If ret == NULL, we're just want to check if AF_VSOCK is available, so accept
-         * any address. Otherwise, filter out special addresses that are cannot be used
-         * to identify _this_ machine from the outside. */
-        if (ret && IN_SET(tmp, VMADDR_CID_LOCAL, VMADDR_CID_HOST, VMADDR_CID_ANY))
-                return log_debug_errno(SYNTHETIC_ERRNO(EADDRNOTAVAIL),
-                                       "IOCTL_VM_SOCKETS_GET_LOCAL_CID returned special value (%u), ignoring.", tmp);
-
-        if (ret)
-                *ret = tmp;
         return 0;
 }
 
@@ -1912,4 +1895,28 @@ int tos_to_priority(uint8_t tos) {
         default:
                 return TC_PRIO_BESTEFFORT;
         }
+}
+
+int socket_xattr_supported(void) {
+        int r;
+
+        // FIXME: Drop this check once Linux 7.1 becomes our baseline
+
+        static int cached = -1;
+        if (cached >= 0)
+                return cached;
+
+        _cleanup_close_ int fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, /* protocol= */ 0);
+        if (fd < 0)
+                return -errno;
+
+        /* Old kernels return EPERM. But let's also check for more appropriate error codes, to be friendly to
+         * seccomp policies */
+        r = xsetxattr(fd, /* path= */ NULL, AT_EMPTY_PATH, "user.testxxx", "1");
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r) || r == -EPERM)
+                return (cached = false);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to set test xattr on socket: %m");
+
+        return (cached = true);
 }

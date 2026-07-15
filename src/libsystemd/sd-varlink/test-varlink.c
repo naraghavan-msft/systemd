@@ -452,6 +452,78 @@ TEST(invalid_parameter) {
         ASSERT_OK(sd_event_loop(e));
 }
 
+typedef struct MandatoryTypeWithOptionalField {
+        const char *mandatory;
+        const char *optional;
+} MandatoryTypeWithOptionalField;
+
+static int dispatch_mandatory_type_with_optional_field(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        MandatoryTypeWithOptionalField *m = ASSERT_PTR(userdata);
+        static const sd_json_dispatch_field dispatch[] = {
+                { "mandatory", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, voffsetof(*m, mandatory), SD_JSON_MANDATORY },
+                { "optional",  SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, voffsetof(*m, optional), 0 },
+                {}
+        };
+
+        return sd_json_dispatch(variant, dispatch, flags, m);
+}
+
+static int method_mandatory_type_with_optional_field(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        MandatoryTypeWithOptionalField m = { NULL, NULL };
+        int r;
+
+        sd_json_dispatch_field table[] = {
+                { "mandatoryField", SD_JSON_VARIANT_OBJECT, dispatch_mandatory_type_with_optional_field, 0, SD_JSON_MANDATORY },
+                {}
+        };
+
+        r = sd_varlink_dispatch(link, parameters, table, &m);
+        if (r != 0)
+                return r;
+
+        _cleanup_free_ char *sum = strjoin(m.mandatory, "+", m.optional);
+        if (!sum)
+                return log_oom();
+
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", sum));
+}
+
+static int reply_valid_hi(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(parameters, "result")), "hi+");
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(mandatory_type_with_optional_field) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "foo.mytest.MandatoryTypeWithOptionalField", method_mandatory_type_with_optional_field));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_valid_hi));
+
+        ASSERT_OK(sd_varlink_invokebo(c, "foo.mytest.MandatoryTypeWithOptionalField",
+                                      SD_JSON_BUILD_PAIR_OBJECT("mandatoryField",
+                                                                SD_JSON_BUILD_PAIR_STRING("mandatory", "hi"))));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
 static int method_with_error_sentinel(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         /* Set an error sentinel and return without sending a reply. The sentinel error should be sent automatically. */
         ASSERT_OK(sd_varlink_set_sentinel(link, "io.test.SentinelError"));
@@ -1099,6 +1171,127 @@ TEST(upgrade_pipelining) {
         ASSERT_OK(sd_varlink_server_attach_event(s, e, 0));
 
         ASSERT_OK(sd_fiber_new(e, "upgrade-pipelining-client", upgrade_pipelining_client_fiber, (void*) sp, /* destroy= */ NULL, &f));
+
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_OK(sd_future_result(f));
+}
+
+/* Stashes the fds handed to the asynchronous upgrade callback so the raw-I/O fiber can pick them up.
+ * A single connection is upgraded per test run, so globals are sufficient. */
+static int respond_upgrade_input_fd = -EBADF;
+static int respond_upgrade_output_fd = -EBADF;
+
+static int respond_upgrade_io_fiber(void *arg) {
+        _cleanup_close_ int input_fd = TAKE_FD(respond_upgrade_input_fd), output_fd = TAKE_FD(respond_upgrade_output_fd);
+
+        /* Same reverse-echo raw protocol as method_upgrade(), but reached through the asynchronous
+         * upgrade callback instead of a synchronous fiber method: read until the client shuts down its
+         * write side, reverse the bytes, and write them back. */
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(input_fd, buf, sizeof(buf) - 1, /* do_poll= */ true));
+        ASSERT_GT(n, 0);
+
+        for (ssize_t i = 0; i < n / 2; i++)
+                SWAP_TWO(buf[i], buf[n - 1 - i]);
+
+        ASSERT_OK(loop_write(output_fd, buf, n));
+
+        return 0;
+}
+
+static int respond_upgrade_callback(sd_varlink *link, int input_fd, int output_fd, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+
+        /* The upgrade callback is invoked from sd_varlink_process() in the main event loop (not a
+         * fiber), so it must not block on raw I/O. Hand the connection's fds to a floating fiber that
+         * speaks the raw protocol, allowing the client fiber to make progress concurrently. Ownership of
+         * the fds is transferred to us regardless of what happens next, so stash them before spawning. */
+        respond_upgrade_input_fd = input_fd;
+        respond_upgrade_output_fd = output_fd;
+
+        ASSERT_OK(sd_fiber_new(e, "respond-upgrade-io", respond_upgrade_io_fiber, /* userdata= */ NULL, /* destroy= */ NULL, /* ret= */ NULL));
+
+        return 0;
+}
+
+static int method_respond_upgrade(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        int r;
+
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_UPGRADE));
+
+        /* Register the async upgrade callback, then enqueue the final reply. Unlike
+         * sd_varlink_reply_and_upgrade(), sd_varlink_respond_and_upgradebo() returns immediately without
+         * blocking: the reply is flushed by the event loop and the fds are subsequently handed to
+         * respond_upgrade_callback(). This is why the method may be bound as a regular (non-fiber) method. */
+        ASSERT_OK(sd_varlink_bind_upgrade(link, respond_upgrade_callback));
+
+        r = sd_varlink_respond_and_upgradebo(
+                        link,
+                        SD_JSON_BUILD_PAIR_STRING("greeting", "aloha"));
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+static int respond_upgrade_client_fiber(void *arg) {
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        sd_json_variant *o = NULL;
+        const char *error_id = NULL;
+
+        ASSERT_OK(sd_varlink_connect_address(&c, arg));
+        ASSERT_OK(sd_varlink_set_description(c, "respond-upgrade-client"));
+
+        ASSERT_OK(sd_varlink_call_and_upgrade(c, "io.test.RespondUpgrade", /* parameters= */ NULL, &o, &error_id, &input_fd, &output_fd));
+        ASSERT_NULL(error_id);
+
+        /* The reply parameters enqueued asynchronously by the server must have arrived intact. */
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(o, "greeting")), "aloha");
+
+        ASSERT_GE(input_fd, 0);
+        ASSERT_GE(output_fd, 0);
+        ASSERT_NE(input_fd, output_fd); /* library dups for bidirectional sockets */
+
+        /* Send a test string, shut down write side so the server sees EOF, then read the reversed reply */
+        static const char msg[] = "Hello!";
+        ASSERT_OK(loop_write(output_fd, msg, strlen(msg)));
+        ASSERT_OK_ERRNO(shutdown(output_fd, SHUT_WR));
+
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(input_fd, buf, strlen(msg), /* do_poll= */ true));
+        ASSERT_EQ((size_t) n, strlen(msg));
+        ASSERT_STREQ(buf, "!olleH");
+
+        ASSERT_OK(sd_event_exit(sd_fiber_get_event(), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(respond_upgrade) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        const char *sp;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir));
+        sp = strjoina(tmpdir, "/socket");
+
+        ASSERT_OK(sd_event_new(&e));
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_UPGRADABLE|SD_VARLINK_SERVER_INHERIT_USERDATA));
+        ASSERT_OK(sd_varlink_server_set_description(s, "respond-upgrade-server"));
+        /* The event loop is propagated to the async upgrade callback via the connection userdata (inherited
+         * from the server) so the callback can spawn the raw-I/O fiber. */
+        sd_varlink_server_set_userdata(s, e);
+        /* Unlike TEST(upgrade), this is a *regular* (non-fiber) method: it drives the asynchronous
+         * sd_varlink_respond_and_upgradebo() API, which never blocks the event loop on a single client. */
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.RespondUpgrade", method_respond_upgrade));
+        ASSERT_OK(sd_varlink_server_listen_address(s, sp, 0600));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, 0));
+
+        ASSERT_OK(sd_fiber_new(e, "respond-upgrade-client", respond_upgrade_client_fiber, (void*) sp, /* destroy= */ NULL, &f));
 
         ASSERT_OK(sd_event_loop(e));
 

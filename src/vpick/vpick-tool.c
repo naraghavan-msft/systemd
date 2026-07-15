@@ -115,7 +115,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         break;
 
                 OPTION_SHORT('V', "VERSION", "Look for specified version"):
-                        if (!version_is_valid(opts.arg))
+                        if (!version_is_valid(opts.arg, /* flags= */ 0))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid version string: %s", opts.arg);
 
                         r = free_and_strdup_warn(&arg_filter_version, opts.arg);
@@ -237,8 +237,9 @@ static int run(int argc, char *argv[]) {
                         return log_error_errno(r, "Failed to make path '%s' absolute: %m", *i);
 
                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               p,
                               &(PickFilter) {
                                       .basename = arg_filter_basename,

@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_ACL
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBACL
+#  error "missing libacl_cflags in meson dependency."
+#endif
+
 #include <acl/libacl.h> /* IWYU pragma: export */
 #include <sys/acl.h>    /* IWYU pragma: export */
 
@@ -92,7 +97,13 @@ static inline int fd_add_uid_acl_permission(int fd, uid_t uid, unsigned mask) {
 }
 #endif
 
-int dlopen_libacl(int log_level);
+int dlopen_libacl(int log_level) _dlopen_loader_;
+
+#define DLOPEN_LIBACL(log_level, priority)                              \
+        ({                                                              \
+                LIBACL_NOTE(priority);                                  \
+                dlopen_libacl(log_level);                               \
+        })
 
 int fd_acl_make_read_only(int fd);
 int fd_acl_make_writable(int fd);

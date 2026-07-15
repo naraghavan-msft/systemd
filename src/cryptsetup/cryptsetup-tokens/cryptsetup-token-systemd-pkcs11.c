@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <libcryptsetup.h>
 #include <syslog.h>
 
 #include "sd-json.h"
@@ -8,6 +7,7 @@
 #include "alloc-util.h"
 #include "cryptsetup-token.h"
 #include "cryptsetup-token-util.h"
+#include "dlopen-note.h"
 #include "luks2-pkcs11.h"
 #include "memory-util.h"
 #include "pkcs11-util.h"
@@ -18,7 +18,10 @@
 #define TOKEN_VERSION_MINOR "0"
 
 /* for libcryptsetup debug purpose */
-_public_ const char *cryptsetup_token_version(void) {
+_public_ const char* cryptsetup_token_version(void) {
+        LIBCRYPTO_NOTE(suggested);
+        LIBP11KIT_NOTE(suggested);
+
         return TOKEN_VERSION_MAJOR "." TOKEN_VERSION_MINOR " systemd-v" PROJECT_VERSION_FULL " (" GIT_VERSION ")";
 }
 
@@ -37,7 +40,7 @@ _public_ int cryptsetup_token_open_pin(
         assert(pin || pin_size == 0);
         assert(token >= 0);
 
-        r = dlopen_cryptsetup(LOG_DEBUG);
+        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, required);
         if (r < 0)
                 return r;
 
@@ -95,7 +98,7 @@ _public_ void cryptsetup_token_dump(
         _cleanup_free_ void *pkcs11_key = NULL;
         Pkcs11RsaPadding rsa_padding = PKCS11_RSA_PADDING_PKCS1V15;
 
-        if (dlopen_cryptsetup(LOG_DEBUG) < 0)
+        if (DLOPEN_CRYPTSETUP(LOG_DEBUG, required) < 0)
                 return;
 
         r = parse_luks2_pkcs11_data(cd, json, &pkcs11_uri, &pkcs11_key, &pkcs11_key_size, &rsa_padding);
@@ -125,7 +128,7 @@ _public_ int cryptsetup_token_validate(
         sd_json_variant *w;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
 
-        r = dlopen_cryptsetup(LOG_DEBUG);
+        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, required);
         if (r < 0)
                 return r;
 

@@ -3,7 +3,7 @@
 
 #include <stdlib.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 #include "memory-util.h"        /* IWYU pragma: keep */
 
 #if HAS_FEATURE_MEMORY_SANITIZER
@@ -21,7 +21,7 @@
 #define alloca_safe(n)                                                  \
         ({                                                              \
                 size_t _nn_ = (n);                                      \
-                assert(_nn_ <= ALLOCA_MAX);                             \
+                assert_se(_nn_ <= ALLOCA_MAX);                          \
                 alloca(_nn_ == 0 ? 1 : _nn_);                           \
         })                                                              \
 

@@ -846,13 +846,51 @@ TEST(condition_test_credential) {
         ASSERT_OK(set_unset_env("ENCRYPTED_CREDENTIALS_DIRECTORY", d2, /* overwrite= */ true));
 }
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
 TEST(condition_test_cpufeature) {
         Condition *condition;
 
+#if defined(__i386__)
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fpu", false, false)));
         ASSERT_OK_POSITIVE(condition_test(condition, environ));
         condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "x86.fpu", false, false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.fpu", false, false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+#elif defined(__x86_64__)
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fpu", false, false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "x86-64.fpu", false, false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.fpu", false, false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+#elif defined(__aarch64__)
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fp", false, false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "asimd", false, false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "arm64.asimd", false, false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.asimd", false, false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+#endif
 
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "somecpufeaturethatreallydoesntmakesense", false, false)));
         ASSERT_OK_ZERO(condition_test(condition, environ));
@@ -1037,7 +1075,8 @@ TEST(condition_test_group) {
         Condition *condition;
         char gid[DECIMAL_STR_MAX(uint32_t)];
         gid_t *gids, max_gid;
-        int ngroups_max, ngroups, r, i;
+        int ngroups, r, i;
+        int ngroups_max;
 
         xsprintf(gid, "%u", UINT32_C(0xFFFF));
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_GROUP, gid, false, false)));
@@ -1053,7 +1092,7 @@ TEST(condition_test_group) {
         ASSERT_OK_POSITIVE(r);
         condition_free(condition);
 
-        ngroups_max = ASSERT_OK_ERRNO(sysconf(_SC_NGROUPS_MAX));
+        ngroups_max = ASSERT_OK(sysconf_ngroups_max());
         ASSERT_GT(ngroups_max, 0);
 
         gids = newa(gid_t, ngroups_max);
@@ -1472,6 +1511,69 @@ TEST(condition_test_machine_tag) {
                                     WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "webserver", /* trigger= */ false, /* negate= */ false)));
         ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Key/value (parameterized) tags */
+        ASSERT_OK(write_string_file(f, "TAGS=\"role=webserver:env=prod:berlin\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+
+        /* Exact match of a key/value tag */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=webserver", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Glob on the value */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=web*", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Glob on the key */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "*=prod", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* A bare key does not match an assignment (the "=" is part of the tag) */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Right key, wrong value → no match */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=database", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* A plain (non-parameterized) tag still matches alongside key/value tags */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "berlin", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Negation against a key/value tag */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=database", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=webserver", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Conflicting values for the same key: graceful parsing keeps the first (lexicographically smallest)
+         * value and drops the rest, so only "env=prod" remains visible. */
+        ASSERT_OK(write_string_file(f, "TAGS=\"env=staging:env=prod\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "env=prod", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "env=staging", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Invalid key/value tags in the file are ignored, valid ones still match */
+        ASSERT_OK(write_string_file(f, "TAGS=\"bad-=x:role=good\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "bad-=x", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=good", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
         condition_free(condition);
 
         ASSERT_OK(set_unset_env("SYSTEMD_ETC_MACHINE_INFO", saved, /* overwrite= */ true));

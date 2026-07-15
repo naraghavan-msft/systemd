@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_LIBMOUNT
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBMOUNT
+#  error "missing libmount_cflags in meson dependency."
+#endif
 
 /* This needs to be after sys/mount.h */
 #include <libmount.h> /* IWYU pragma: export */
@@ -77,7 +81,6 @@ int libmount_is_leaf(
 
 struct libmnt_monitor;
 
-
 static inline void* sym_mnt_unref_monitor(struct libmnt_monitor *p) {
         assert(p == NULL);
         return NULL;
@@ -85,4 +88,10 @@ static inline void* sym_mnt_unref_monitor(struct libmnt_monitor *p) {
 
 #endif
 
-int dlopen_libmount(int log_level);
+int dlopen_libmount(int log_level) _dlopen_loader_;
+
+#define DLOPEN_LIBMOUNT(log_level, priority)                            \
+        ({                                                              \
+                LIBMOUNT_NOTE(priority);                                \
+                dlopen_libmount(log_level);                             \
+        })

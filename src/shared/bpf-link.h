@@ -2,10 +2,13 @@
 #pragma once
 
 #if HAVE_LIBBPF
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBBPF
+#  error "missing libbpf_cflags in meson dependency."
+#endif
 
 #include <bpf/libbpf.h>
 
-#include "shared-forward.h"
+#include "forward.h"
 
 bool bpf_can_link_program(struct bpf_program *prog);
 bool bpf_can_link_lsm_program(struct bpf_program *prog);

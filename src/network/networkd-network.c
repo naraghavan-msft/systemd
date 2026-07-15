@@ -138,7 +138,7 @@ int network_verify(Network *network) {
                                          network->filename);
 
         /* skip out early if configuration does not match the environment */
-        if (!condition_test_list(network->conditions, environ, NULL, NULL, NULL))
+        if (!condition_test_list_net(network->conditions, environ, NULL, NULL, NULL))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s: Conditions in the file do not match the system environment, skipping.",
                                        network->filename);
@@ -554,7 +554,6 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                         "DHCPServer\0"
                         "DHCPServerStaticLease\0"
                         "IPv6AcceptRA\0"
-                        "IPv6NDPProxyAddress\0"
                         "Bridge\0"
                         "BridgeFDB\0"
                         "BridgeMDB\0"

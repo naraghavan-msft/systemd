@@ -173,7 +173,9 @@ SD_VARLINK_DEFINE_ENUM_TYPE(
                 SD_VARLINK_DEFINE_ENUM_VALUE(preferred),
                 SD_VARLINK_DEFINE_ENUM_VALUE(bind),
                 SD_VARLINK_DEFINE_ENUM_VALUE(interleave),
-                SD_VARLINK_DEFINE_ENUM_VALUE(local));
+                SD_VARLINK_DEFINE_ENUM_VALUE(local),
+                SD_VARLINK_DEFINE_ENUM_VALUE(preferred_many),
+                SD_VARLINK_DEFINE_ENUM_VALUE(weighted_interleave));
 
 SD_VARLINK_DEFINE_ENUM_TYPE(
                 MountPropagationFlag,
@@ -1415,6 +1417,12 @@ static SD_VARLINK_DEFINE_STRUCT_TYPE(
                 ServiceContext,
                 SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#Type="),
                 SD_VARLINK_DEFINE_FIELD_BY_TYPE(Type, ServiceType, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Index of a file descriptor passed along with the method call to connect to the service's standard input. Only settable at unit creation time via StartTransient(); never set in unit descriptions returned by List()."),
+                SD_VARLINK_DEFINE_FIELD(StandardInputFileDescriptor, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Index of a file descriptor passed along with the method call to connect to the service's standard output. Only settable at unit creation time via StartTransient()."),
+                SD_VARLINK_DEFINE_FIELD(StandardOutputFileDescriptor, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Index of a file descriptor passed along with the method call to connect to the service's standard error. Only settable at unit creation time via StartTransient()."),
+                SD_VARLINK_DEFINE_FIELD(StandardErrorFileDescriptor, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#ExitType="),
                 SD_VARLINK_DEFINE_FIELD_BY_TYPE(ExitType, ServiceExitType, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#Restart="),
@@ -1429,6 +1437,8 @@ static SD_VARLINK_DEFINE_STRUCT_TYPE(
                 SD_VARLINK_DEFINE_FIELD(RestartSteps, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#RestartMaxDelaySec="),
                 SD_VARLINK_DEFINE_FIELD(RestartMaxDelayUSec, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#RestartRandomizedDelaySec="),
+                SD_VARLINK_DEFINE_FIELD(RestartRandomizedDelayUSec, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#TimeoutStartSec="),
                 SD_VARLINK_DEFINE_FIELD(TimeoutStartUSec, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("https://www.freedesktop.org/software/systemd/man/"PROJECT_VERSION_STR"/systemd.service.html#TimeoutStopSec="),
