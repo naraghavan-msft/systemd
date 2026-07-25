@@ -1428,6 +1428,23 @@ size_t strspn_from_end(const char *str, const char *accept) {
         return n;
 }
 
+size_t strnspn(const char *str, const char *accept, size_t n) {
+        size_t i;
+
+        /* Like strspn(), but reads at most 'n' bytes from 'str'. Returns the length of the initial
+         * run of 'str' (capped at 'n') that consists solely of bytes found in 'accept'. Stops at a
+         * NUL byte too. Unlike strspn() this is safe on a buffer that is not NUL terminated within
+         * 'n' bytes. */
+
+        assert(str || n == 0);
+        assert(accept);
+
+        for (i = 0; i < n && str[i] != '\0' && strchr(accept, str[i]); i++)
+                ;
+
+        return i;
+}
+
 char* strdupspn(const char *a, const char *accept) {
         if (isempty(a) || isempty(accept))
                 return strdup("");
@@ -1503,7 +1520,7 @@ char* find_line_after_internal(const char *haystack, const char *needle) {
 
 bool version_is_valid(const char *s, VersionFlags flags) {
 
-        /* Validates a version string superficially. This does not proces the version string in any
+        /* Validates a version string superficially. This does not process the version string in any
          * semantical way, it mostly just validates that its charset is reasonable. */
 
         if (FLAGS_SET(flags, VERSION_ALLOW_EMPTY) ? !s : isempty(s))

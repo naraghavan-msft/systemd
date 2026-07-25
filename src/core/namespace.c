@@ -1643,6 +1643,8 @@ static int mount_mqueuefs(const MountEntry *m) {
         (void) umount_recursive(entry_path, 0);
 
         r = mount_nofollow_verbose(LOG_DEBUG, "mqueue", entry_path, "mqueue", m->flags, mount_entry_options(m));
+        if (r == -ENODEV) /* POSIX message queues may be disabled in the kernel. */
+                return 0;
         if (r < 0)
                 return r;
 
@@ -3986,7 +3988,7 @@ int refresh_extensions_in_namespace(
         if (r > 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Target namespace is not separate, cannot reload extensions");
 
-        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        (void) dlopen_cryptsetup(LOG_DEBUG);
 
         extension_dir = path_join(p->private_namespace_dir, "unit-extensions");
         if (!extension_dir)

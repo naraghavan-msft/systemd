@@ -1808,6 +1808,10 @@ static int unmerge_hierarchy(const Context *c, const char *p, const char *submou
                         l = cunescape_length(escaped_work_dir_in_root, r, 0, &work_dir_in_root);
                         if (l < 0)
                                 return log_error_errno(l, "Failed to unescape work directory path: %m");
+                        if (path_is_absolute(work_dir_in_root) || !path_is_normalized(work_dir_in_root))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid work directory path '%s'.", work_dir_in_root);
+
                         work_dir = path_join(c->root, work_dir_in_root);
                         if (!work_dir)
                                 return log_oom();
@@ -1910,7 +1914,7 @@ static int unmerge(const Context *c) {
 
         assert(c);
 
-        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
+        (void) dlopen_libmount(LOG_DEBUG);
 
         r = get_extension_release_metadata(c, &need_to_reload, &units_to_restart, &units_to_reload_or_restart);
         if (r < 0)
@@ -2488,9 +2492,9 @@ static int merge(const Context *c, Hashmap *images) {
 
         assert(c);
 
-        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
-        (void) DLOPEN_LIBBLKID(LOG_DEBUG, required);
-        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
+        (void) dlopen_cryptsetup(LOG_DEBUG);
+        (void) dlopen_libblkid(LOG_DEBUG);
+        (void) dlopen_libmount(LOG_DEBUG);
 
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         r = pidref_safe_fork("(sd-merge)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_NEW_MOUNTNS, &pidref);
@@ -3267,7 +3271,10 @@ static int run(int argc, char *argv[]) {
         char **args = NULL;
         int r;
 
+        LIBBLKID_NOTE(required);
         LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(recommended);
+        LIBMOUNT_NOTE(required);
         LIBSELINUX_NOTE(recommended);
 
         log_setup();

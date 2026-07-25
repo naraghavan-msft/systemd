@@ -193,19 +193,20 @@ static int parse_one_option(const char *option) {
                         return log_oom();
 
         } else if ((val = startswith(option, "size="))) {
+                unsigned key_size;
 
-                r = safe_atou(val, &arg_key_size);
+                r = safe_atou(val, &key_size);
                 if (r < 0) {
                         log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
                         return 0;
                 }
 
-                if (arg_key_size % 8) {
+                if (key_size % 8) {
                         log_warning("size= not a multiple of 8, ignoring.");
                         return 0;
                 }
 
-                arg_key_size /= 8;
+                arg_key_size = key_size / 8;
 
         } else if ((val = startswith(option, "sector-size="))) {
 
@@ -310,8 +311,6 @@ static int parse_one_option(const char *option) {
                         SET_FLAG(arg_ask_password_flags, ASK_PASSWORD_SILENT, !r);
                 }
         } else if ((val = startswith(option, "password-cache="))) {
-                arg_password_cache_set = true;
-
                 if (streq(val, "read-only")) {
                         arg_ask_password_flags |= ASK_PASSWORD_ACCEPT_CACHED;
                         arg_ask_password_flags &= ~ASK_PASSWORD_PUSH_CACHE;
@@ -324,6 +323,8 @@ static int parse_one_option(const char *option) {
 
                         SET_FLAG(arg_ask_password_flags, ASK_PASSWORD_ACCEPT_CACHED|ASK_PASSWORD_PUSH_CACHE, r);
                 }
+
+                arg_password_cache_set = true;
         } else if (STR_IN_SET(option, "allow-discards", "discard"))
                 arg_discards = true;
         else if (streq(option, "same-cpu-crypt"))
@@ -539,7 +540,7 @@ static int parse_one_option(const char *option) {
 #if HAVE_OPENSSL
                 _cleanup_strv_free_ char **l = NULL;
 
-                r = DLOPEN_LIBCRYPTO(LOG_ERR, recommended);
+                r = dlopen_libcrypto(LOG_ERR);
                 if (r < 0)
                         return r;
 
@@ -1138,20 +1139,15 @@ static int measure_keyslot(
         if (!s)
                 return log_oom();
 
-        r = tpm2_nvpcr_extend_bytes(c, /* session= */ NULL, arg_tpm2_measure_keyslot_nvpcr, &IOVEC_MAKE_STRING(s), /* secret= */ NULL, TPM2_EVENT_KEYSLOT, s);
-        if (r == -ENETDOWN) {
-                /* NvPCR is not initialized yet. Do so now. */
-                _cleanup_(iovec_done_erase) struct iovec anchor_secret = {};
-                r = tpm2_nvpcr_acquire_anchor_secret(&anchor_secret, /* sync_secondary= */ false);
-                if (r < 0)
-                        return r;
-
-                r = tpm2_nvpcr_initialize(c, /* session= */ NULL, arg_tpm2_measure_keyslot_nvpcr, &anchor_secret);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to extend NvPCR index '%s' with anchor secret: %m", name);
-
-                r = tpm2_nvpcr_extend_bytes(c, /* session= */ NULL, arg_tpm2_measure_keyslot_nvpcr, &IOVEC_MAKE_STRING(s), /* secret= */ NULL, TPM2_EVENT_KEYSLOT, s);
-        }
+        r = tpm2_nvpcr_extend_bytes(
+                        c,
+                        /* session= */ NULL,
+                        arg_tpm2_measure_keyslot_nvpcr,
+                        &IOVEC_MAKE_STRING(s),
+                        /* secret= */ NULL,
+                        /* sync_secondary_anchor= */ false,
+                        TPM2_EVENT_KEYSLOT,
+                        s);
         if (r < 0)
                 return log_error_errno(r, "Could not extend NvPCR: %m");
 
@@ -2890,6 +2886,8 @@ static int run(int argc, char *argv[]) {
         int r;
 
         LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(required);
         LIBFIDO2_NOTE(suggested);
         LIBMOUNT_NOTE(recommended);
         LIBP11KIT_NOTE(suggested);
@@ -2904,7 +2902,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = DLOPEN_CRYPTSETUP(LOG_ERR, required);
+        r = dlopen_cryptsetup(LOG_ERR);
         if (r < 0)
                 return r;
 
